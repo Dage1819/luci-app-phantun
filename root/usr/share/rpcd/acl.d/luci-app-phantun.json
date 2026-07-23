@@ -1,0 +1,24 @@
+{
+	"luci-app-phantun": {
+		"description": "Grant access for luci-app-phantun",
+		"read": {
+			"uci": [ "phantun" ],
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"file": {
+				"/usr/share/phantun/manage.sh *": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "phantun" ],
+			"ubus": {
+				"service": [ "event" ]
+			},
+			"file": {
+				"/etc/init.d/phantun *": [ "exec" ],
+				"/usr/share/phantun/manage.sh *": [ "exec" ]
+			}
+		}
+	}
+}
