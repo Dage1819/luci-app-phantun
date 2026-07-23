@@ -1,0 +1,14 @@
+{
+	"admin/services/phantun": {
+		"title": "Phantun",
+		"order": 62,
+		"action": {
+			"type": "view",
+			"path": "phantun/phantun"
+		},
+		"depends": {
+			"acl": [ "luci-app-phantun" ],
+			"uci": { "phantun": true }
+		}
+	}
+}

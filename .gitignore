@@ -1,0 +1,6 @@
+# build artifacts
+*.ipk
+*.o
+*.tmp
+tmp/
+.DS_Store

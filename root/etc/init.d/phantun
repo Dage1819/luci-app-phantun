@@ -1,0 +1,227 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+SERVER_BIN=/usr/bin/phantun_server
+CLIENT_BIN=/usr/bin/phantun_client
+NFT_HELPER=/usr/share/phantun/nftrules.sh
+MONITOR=/usr/share/phantun/monitor.sh
+BYPASS=/usr/share/phantun/bypass.sh
+
+[ -f "$BYPASS" ] && . "$BYPASS"
+
+DNS_SERVER=""
+BYPASS_PROXY="1"
+
+# Return 0 if the argument looks like an IPv4/IPv6 literal, 1 if it's a domain.
+is_ip_literal() {
+	local addr="$1"
+	case "$addr" in
+		*[!0-9.]*) ;;
+		*.*.*.*) return 0 ;;
+	esac
+	case "$addr" in
+		*:*) return 0 ;;
+	esac
+	return 1
+}
+
+# Resolve a domain to an address according to family.
+# family: ipv4 (A only, default), ipv6 (AAAA only). Tries the configured DNS
+# first; falls back to the system resolver if it yields nothing.
+resolve_addr() {
+	local domain="$1" family="$2" dns="$3"
+	local ip=""
+
+	_host_a()    { host -t A    "$domain" $1 2>/dev/null | awk '/has address/ {print $NF; exit}'; }
+	_host_aaaa() { host -t AAAA "$domain" $1 2>/dev/null | awk '/has IPv6 address/ {print $NF; exit}'; }
+	_drill_a() {
+		local s=""; [ -n "$1" ] && s="@$1"
+		drill "$domain" $s A 2>/dev/null | awk '!/^;/ && $4=="A" {print $5; exit}'
+	}
+	_drill_aaaa() {
+		local s=""; [ -n "$1" ] && s="@$1"
+		drill "$domain" $s AAAA 2>/dev/null | awk '!/^;/ && $4=="AAAA" {print $5; exit}'
+	}
+	_resolve_a() {
+		if command -v host >/dev/null 2>&1; then _host_a "$1"; else _drill_a "$1"; fi
+	}
+	_resolve_aaaa() {
+		if command -v host >/dev/null 2>&1; then _host_aaaa "$1"; else _drill_aaaa "$1"; fi
+	}
+	_try() {
+		local d="$1"
+		case "$family" in
+			ipv6) _resolve_aaaa "$d" ;;
+			*)    _resolve_a "$d" ;;
+		esac
+	}
+
+	ip=$(_try "$dns")
+	if [ -z "$ip" ] && [ -n "$dns" ]; then
+		ip=$(_try "")
+	fi
+	echo "$ip"
+}
+
+# Format an address for use in --local / --remote (wrap IPv6 in brackets).
+fmt_addr() {
+	local addr="$1"
+	case "$addr" in
+		*:*) echo "[$addr]" ;;
+		*)   echo "$addr" ;;
+	esac
+}
+
+start_rule() {
+	local cfg="$1"
+	local enabled name mode family local_port local_addr remote_addr remote_port
+	local tun_name log_level extra_args
+
+	config_get_bool enabled "$cfg" enabled 0
+	[ "$enabled" = "1" ] || return 0
+
+	config_get name "$cfg" name "$cfg"
+	config_get mode "$cfg" mode "client"
+	config_get family "$cfg" family "ipv4"
+	config_get local_addr "$cfg" local_addr ""
+	config_get local_port "$cfg" local_port ""
+	config_get remote_addr "$cfg" remote_addr ""
+	config_get remote_port "$cfg" remote_port ""
+	config_get tun_name "$cfg" tun_name ""
+	config_get log_level "$cfg" log_level "info"
+	config_get extra_args "$cfg" extra_args ""
+
+	if [ "$mode" = "server" ]; then
+		# Server: --local is a TCP port to listen on; --remote is the UDP
+		# service to forward to (host:port).
+		[ -x "$SERVER_BIN" ] || { logger -t phantun "server binary missing, rule $name skipped"; return 0; }
+		[ -n "$local_port" ] || { logger -t phantun "rule $name: no local_port"; return 0; }
+		[ -n "$remote_addr" ] && [ -n "$remote_port" ] || { logger -t phantun "rule $name: no remote"; return 0; }
+
+		local rhost
+		rhost=$(fmt_addr "$remote_addr")
+
+		procd_open_instance "$name"
+		procd_set_param command "$SERVER_BIN" --local "$local_port" --remote "${rhost}:${remote_port}"
+	else
+		# Client: --local is the local UDP endpoint (host:port) apps connect
+		# to; --remote is the Phantun server (host:port). Resolve domains here
+		# so we control the address family; phantun itself only resolves once.
+		[ -x "$CLIENT_BIN" ] || { logger -t phantun "client binary missing, rule $name skipped"; return 0; }
+		[ -n "$local_port" ] || { logger -t phantun "rule $name: no local_port"; return 0; }
+		[ -n "$remote_addr" ] && [ -n "$remote_port" ] || { logger -t phantun "rule $name: no remote"; return 0; }
+
+		local peer="$remote_addr"
+		if ! is_ip_literal "$remote_addr"; then
+			peer=$(resolve_addr "$remote_addr" "$family" "$DNS_SERVER")
+			if [ -z "$peer" ]; then
+				logger -t phantun "rule $name: cannot resolve $remote_addr, skipping"
+				return 0
+			fi
+		fi
+
+		[ -z "$local_addr" ] && local_addr="127.0.0.1"
+		local lhost rhost
+		lhost=$(fmt_addr "$local_addr")
+		rhost=$(fmt_addr "$peer")
+
+		procd_open_instance "$name"
+		procd_set_param command "$CLIENT_BIN" --local "${lhost}:${local_port}" --remote "${rhost}:${remote_port}"
+	fi
+
+	# Optional custom TUN interface name.
+	[ -n "$tun_name" ] && procd_append_param command --tun "$tun_name"
+	[ -n "$extra_args" ] && procd_append_param command $extra_args
+
+	# Phantun reads log level from the RUST_LOG env var.
+	procd_set_param env RUST_LOG="$log_level"
+
+	# Needs CAP_NET_ADMIN to create the TUN; running as root (default) is simplest.
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+start_service() {
+	config_load phantun
+	config_get DNS_SERVER global dns_server ""
+	config_get_bool BYPASS_PROXY global bypass_proxy 1
+	config_get PH_WAN_IFACE global wan_iface ""
+
+	# Phantun routes packets through a TUN interface, so kernel IP forwarding
+	# must be on for both the server-side DNAT and client-side routing to work.
+	sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+	sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+
+	# Force resolver DNS traffic out via the physical WAN, bypassing the
+	# tunnel, so a domain-based client can always re-resolve/reconnect even
+	# after the tunnel drops (avoids the resolve-through-dead-tunnel deadlock).
+	if [ "$BYPASS_PROXY" = "1" ] && [ -n "$DNS_SERVER" ] && command -v ph_bypass_add >/dev/null 2>&1; then
+		ph_bypass_add "$DNS_SERVER"
+	fi
+
+	# (Re)build NAT/forwarding rules for the phantun TUN interfaces.
+	[ -x "$NFT_HELPER" ] && "$NFT_HELPER" apply
+
+	config_foreach start_rule rule
+
+	# DDNS monitor: watches client rules with a domain remote + monitor='1'
+	# and restarts the service when the resolved peer IP changes.
+	if [ -x "$MONITOR" ]; then
+		procd_open_instance "ddns-monitor"
+		procd_set_param command "$MONITOR"
+		procd_set_param respawn
+		procd_close_instance
+	fi
+}
+
+stop_service() {
+	config_load phantun
+	config_get DNS_SERVER global dns_server ""
+
+	# Tear down the DNS bypass rules/table we created.
+	if command -v ph_bypass_flush >/dev/null 2>&1; then
+		ph_bypass_flush "$DNS_SERVER"
+	fi
+
+	[ -x "$NFT_HELPER" ] && "$NFT_HELPER" flush
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "phantun"
+}
+
+# ---- Per-rule control (called from the LuCI UI), same model as udp2raw ----
+EXTRA_COMMANDS="rule_start rule_stop rule_restart"
+EXTRA_HELP="	rule_start <name>    Start a single rule instance
+	rule_stop <name>     Stop a single rule instance
+	rule_restart <name>  Restart a single rule instance"
+
+rule_stop() {
+	local name="$1"
+	[ -n "$name" ] || { echo "usage: rule_stop <name>" >&2; return 1; }
+	ubus call service delete "{\"name\":\"phantun\",\"instance\":\"$name\"}" 2>/dev/null
+}
+
+rule_start() {
+	local name="$1"
+	[ -n "$name" ] || { echo "usage: rule_start <name>" >&2; return 1; }
+	start
+}
+
+rule_restart() {
+	local name="$1"
+	[ -n "$name" ] || { echo "usage: rule_restart <name>" >&2; return 1; }
+	rule_stop "$name"
+	sleep 1
+	start
+}

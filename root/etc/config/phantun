@@ -1,0 +1,41 @@
+# phantun configuration
+# Global options
+config global 'global'
+	# GitHub release version of Phantun to fetch on init
+	option version 'v0.8.1'
+	# DNS server used when resolving client peer domains (optional; falls back
+	# to the system resolver if empty or unreachable).
+	option dns_server ''
+	# How often (seconds) the DDNS monitor re-checks watched domains.
+	option check_interval '60'
+	# Force resolver DNS traffic out the physical WAN, bypassing the tunnel,
+	# so a domain-based client can always reconnect after the tunnel drops.
+	option bypass_proxy '1'
+	# Physical WAN interface for the DNS bypass. Empty = autodetect (wan).
+	option wan_iface ''
+	option log_max '100'
+
+# Example server rule (this side has a public IP / is reachable)
+#config rule
+#	option enabled '0'
+#	option name 'server'
+#	option mode 'server'
+#	option local_port '4567'
+#	option remote_addr '127.0.0.1'
+#	option remote_port '51820'
+#	# Auto-manage the firewall: DNAT the public TCP port to phantun's TUN
+#	# and accept it. Recommended for server mode (IPv4).
+#	option auto_fw '1'
+
+# Example client rule (connect to a Phantun server)
+#config rule
+#	option enabled '0'
+#	option name 'client'
+#	option mode 'client'
+#	option family 'ipv4'
+#	option local_addr '127.0.0.1'
+#	option local_port '51820'
+#	option remote_addr 'server.example.com'
+#	option remote_port '4567'
+#	# Re-resolve the domain periodically and restart on IP change (DDNS).
+#	option monitor '0'
