@@ -128,9 +128,19 @@ ph_route_flush_all() {
 	return 0
 }
 
-# CLI entry so postrm/other scripts can flush without sourcing.
-case "$1" in
-	flush_all) ph_route_flush_all ;;
-	"") : ;;
-	*) echo "usage: $0 {flush_all}" >&2; exit 1 ;;
+# CLI entry so postrm/other scripts can flush without sourcing. Guarded by
+# $0: when this file is sourced (". route.sh" from init.d/monitor.sh), $0 is
+# the CALLER's path (e.g. /etc/rc.common), not route.sh, so this block is
+# skipped entirely. Only a DIRECT invocation ("route.sh flush_all") hits it.
+# Without this guard, sourcing would run this case against init.d's own $1
+# (start/stop/rule_stop/...), fall into the `*` branch, and `exit 1` would
+# kill the whole sourcing init.d process.
+case "$0" in
+	*/route.sh|route.sh)
+		case "$1" in
+			flush_all) ph_route_flush_all ;;
+			"") : ;;
+			*) echo "usage: $0 {flush_all}" >&2; exit 1 ;;
+		esac
+		;;
 esac
