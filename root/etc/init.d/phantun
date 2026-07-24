@@ -9,8 +9,10 @@ CLIENT_BIN=/usr/bin/phantun_client
 NFT_HELPER=/usr/share/phantun/nftrules.sh
 MONITOR=/usr/share/phantun/monitor.sh
 BYPASS=/usr/share/phantun/bypass.sh
+ROUTE_HELPER=/usr/share/phantun/route.sh
 
 [ -f "$BYPASS" ] && . "$BYPASS"
+[ -f "$ROUTE_HELPER" ] && . "$ROUTE_HELPER"
 
 DNS_SERVER=""
 BYPASS_PROXY="1"
@@ -123,6 +125,20 @@ start_rule() {
 			fi
 		fi
 
+		# Server exception route (opt-in): when the box's default route points
+		# into a tunnel (WireGuard full-tunnel), steer traffic to the Phantun
+		# server IP out the physical WAN so it does not deadlock inside the
+		# not-yet-established tunnel. Records the resolved IP for precise
+		# teardown on stop/disable/IP-change/uninstall.
+		local route_via_wan
+		config_get_bool route_via_wan "$cfg" route_via_wan 0
+		if [ "$route_via_wan" = "1" ] && command -v ph_route_add >/dev/null 2>&1; then
+			# Clear any stale recorded routes for this rule first, then add the
+			# current peer IP (handles a changed resolution transparently).
+			ph_route_del_cfg "$cfg"
+			ph_route_add "$peer" "$cfg"
+		fi
+
 		[ -z "$local_addr" ] && local_addr="127.0.0.1"
 		local lhost rhost
 		lhost=$(fmt_addr "$local_addr")
@@ -188,6 +204,14 @@ stop_service() {
 		ph_bypass_flush "$DNS_SERVER"
 	fi
 
+	# Remove every server-exception route/rule we installed. A config save in
+	# the UI triggers reload (stop+start), so this also cleans up rules whose
+	# route_via_wan was just unchecked: stop flushes all, start re-adds only
+	# the ones still enabled+checked.
+	if command -v ph_route_flush_all >/dev/null 2>&1; then
+		ph_route_flush_all
+	fi
+
 	[ -x "$NFT_HELPER" ] && "$NFT_HELPER" flush
 }
 
@@ -206,10 +230,27 @@ EXTRA_HELP="	rule_start <name>    Start a single rule instance
 	rule_stop <name>     Stop a single rule instance
 	rule_restart <name>  Restart a single rule instance"
 
+# Find the uci section (cfg) whose name option matches $1, into _PH_FOUND_CFG.
+_PH_FOUND_CFG=""
+_ph_match_name() {
+	local cfg="$1" want="$2" nm
+	config_get nm "$cfg" name "$cfg"
+	[ "$nm" = "$want" ] && _PH_FOUND_CFG="$cfg"
+}
+
 rule_stop() {
 	local name="$1"
 	[ -n "$name" ] || { echo "usage: rule_stop <name>" >&2; return 1; }
 	ubus call service delete "{\"name\":\"phantun\",\"instance\":\"$name\"}" 2>/dev/null
+
+	# Also drop this rule's server-exception route (if any), so stopping a
+	# single client rule leaves no stale route pointing at the physical WAN.
+	if command -v ph_route_del_cfg >/dev/null 2>&1; then
+		config_load phantun
+		_PH_FOUND_CFG=""
+		config_foreach _ph_match_name rule "$name"
+		[ -n "$_PH_FOUND_CFG" ] && ph_route_del_cfg "$_PH_FOUND_CFG"
+	fi
 }
 
 rule_start() {

@@ -15,6 +15,8 @@
 
 BYPASS=/usr/share/phantun/bypass.sh
 [ -f "$BYPASS" ] && . "$BYPASS"
+ROUTE_HELPER=/usr/share/phantun/route.sh
+[ -f "$ROUTE_HELPER" ] && . "$ROUTE_HELPER"
 
 STATE_DIR=/var/run/phantun
 mkdir -p "$STATE_DIR"
@@ -79,14 +81,19 @@ MONITORED=""
 
 collect_rule() {
 	local cfg="$1"
-	local enabled mode remote_addr family monitor name
+	local enabled mode remote_addr family monitor route_via_wan name
 
 	config_get_bool enabled "$cfg" enabled 0
 	[ "$enabled" = "1" ] || return 0
 	config_get mode "$cfg" mode "client"
 	[ "$mode" = "client" ] || return 0
+	# Watch a rule if the user asked for DDNS monitoring, OR if it uses the
+	# server-exception route: a domain peer whose IP changes would otherwise
+	# leave a stale /32 (/128) route pointing at the old server IP, breaking
+	# the tunnel until the next manual restart. Either flag pulls it in.
 	config_get_bool monitor "$cfg" monitor 0
-	[ "$monitor" = "1" ] || return 0
+	config_get_bool route_via_wan "$cfg" route_via_wan 0
+	[ "$monitor" = "1" ] || [ "$route_via_wan" = "1" ] || return 0
 	config_get remote_addr "$cfg" remote_addr ""
 	[ -n "$remote_addr" ] || return 0
 	is_ip_literal "$remote_addr" && return 0

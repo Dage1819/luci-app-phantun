@@ -10,7 +10,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-phantun
-PKG_VERSION:=1.1.1
+PKG_VERSION:=1.2.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=Apache-2.0
@@ -43,6 +43,9 @@ define Package/luci-app-phantun/postrm
 # instances, but kill any stragglers just in case), then remove the
 # runtime-downloaded binaries and all leftover config/state/logs.
 killall phantun_server phantun_client 2>/dev/null
+# Remove any server-exception ip rules / dedicated route table we installed
+# (route_via_wan), so no stale policy routing survives the uninstall.
+[ -x /usr/share/phantun/route.sh ] && /usr/share/phantun/route.sh flush_all 2>/dev/null
 rm -f /usr/bin/phantun_server /usr/bin/phantun_client
 rm -f /tmp/phantun_init.status /tmp/phantun_init.log
 rm -rf /tmp/phantun_dl /var/run/phantun

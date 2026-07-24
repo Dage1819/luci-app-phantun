@@ -38,7 +38,13 @@ LuCI 界面插件，管理 [Phantun](https://github.com/dndx/phantun)（UDP over
 - `htdocs/luci-static/resources/view/phantun/phantun.js` — 前端（状态卡/初始化弹窗/规则表/poll实时刷新）
 
 ## 当前版本
-v1.1.1（PKG_VERSION 在 Makefile）
+v1.2.0（PKG_VERSION 在 Makefile）
+
+### v1.2.0 变更
+- 新增「服务端例外路由」（客户端选项，默认关）：WireGuard 全局代理场景下，为 Phantun 服务端 IP 添加走物理 WAN 的例外路由（独立表 995 + 高优先级 ip rule），破解「隧道要靠自己才能建立」的死锁。
+- 例外路由跟随解析：按 family 分别加 v4(/32)/v6(/128)；开启后自动纳入域名监控，服务端域名 IP 变化时自动更新路由。
+- 生命周期闭环：规则停止 / 取消勾选 / 卸载插件均自动清除对应例外路由（状态文件 `/var/run/phantun/<cfg>.route` 精确记录）。
+- 修复 init.d 脚本 CRLF 换行导致在 OpenWrt 上无法运行的问题。
 
 ## 构建 & 发布
 - 构建：`wsl bash /mnt/c/Users/root/Pictures/wrt/build_phantun.sh`，产物 → `../build/luci-app-phantun_*.ipk`

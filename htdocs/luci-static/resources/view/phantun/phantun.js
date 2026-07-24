@@ -458,6 +458,16 @@ return view.extend({
 		o.depends('mode', 'client');
 		o.modalonly = true;
 
+		o = s.option(form.Flag, 'route_via_wan', '服务端例外路由',
+			'仅客户端。当本机默认路由已整体指向某个隧道（如 WireGuard 全局代理）时，' +
+			'去 Phantun 服务端的流量会被路由进该隧道，形成「隧道要靠自己才能建立」的死锁。' +
+			'勾选后自动为服务端 IP 添加一条走物理 WAN 的明细路由（绕过隧道）。' +
+			'仅在做全局代理时才需要勾选；普通场景请保持关闭。' +
+			'对端为域名时会自动纳入监控：解析 IP 变化时同步更新该路由（无需另开「域名监控」）。');
+		o.default = '0';
+		o.depends('mode', 'client');
+		o.modalonly = true;
+
 		o = s.option(form.Flag, 'auto_fw', '自动防火墙',
 			'仅服务端。勾选后自动把外网 TCP（本地端口）转发到 Phantun 并放行，无需手动配置防火墙。取消勾选并保存后会自动清除对应规则。默认同时覆盖 IPv4 与 IPv6。');
 		o.default = '1';
