@@ -38,13 +38,20 @@ LuCI 界面插件，管理 [Phantun](https://github.com/dndx/phantun)（UDP over
 - `htdocs/luci-static/resources/view/phantun/phantun.js` — 前端（状态卡/初始化弹窗/规则表/poll实时刷新）
 
 ## 当前版本
-v1.2.0（PKG_VERSION 在 Makefile）
+v1.2.2（PKG_VERSION 在 Makefile）
 
 ### v1.2.0 变更
-- 新增「服务端例外路由」（客户端选项，默认关）：WireGuard 全局代理场景下，为 Phantun 服务端 IP 添加走物理 WAN 的例外路由（独立表 995 + 高优先级 ip rule），破解「隧道要靠自己才能建立」的死锁。
+- 新增「服务端例外路由」（客户端选项，默认关）：WireGuard 全局代理场景下，为 Phantun 服务端 IP 添加走物理 WAN 的例外路由，破解「隧道要靠自己才能建立」的死锁。
 - 例外路由跟随解析：按 family 分别加 v4(/32)/v6(/128)；开启后自动纳入域名监控，服务端域名 IP 变化时自动更新路由。
 - 生命周期闭环：规则停止 / 取消勾选 / 卸载插件均自动清除对应例外路由（状态文件 `/var/run/phantun/<cfg>.route` 精确记录）。
 - 修复 init.d 脚本 CRLF 换行导致在 OpenWrt 上无法运行的问题。
+
+### v1.2.1 变更
+- 修复致命 bug：`route.sh` 结尾的 CLI 分支（给 postrm 直接调用用）在被 `source` 进 init.d/monitor.sh 时，会拿 rc.common 的动作词（start/stop/rule_stop 等）去匹配、落入 `*)` 分支 `exit 1`，把整个 init.d 进程杀掉——导致启动/停止/重启按钮全部报错。已加 `$0` 判断，只有直接执行才走 CLI 分支。
+
+### v1.2.2 变更
+- **例外路由改为写 OpenWrt 标准静态路由**（`/etc/config/network` 的 `config route` / `config route6`），不再用独立路由表995 + ip rule。原因：用户环境的隧道默认路由本身就在 main 表，/32 或 /128 明细路由凭最长前缀匹配即可稳定压过 /0 默认路由，且写成标准静态路由后能直接在 LuCI「网络 → 静态路由」页面（IPv4/IPv6 分 tab，与 OpenWrt 原生一致）看到、手动核对、编辑，可管理性大幅提升。UCI 段命名 `phantun_<规则名>_v4`/`_v6`，`comment` 字段标注来源规则，卸载/停止/取消勾选/IP变化时精确删除对应段。
+- 网关解析加内核路由表兜底：`network_get_gateway(6)` 在「网关是 link-local 地址」或「多条 source-specific 默认路由」的环境下可能取不到值，此时回退去解析 `ip [-6] route list default dev <wan>` 的实际 `via`，避免网关为空导致 on-link 路由（会在邻居解析阶段丢包，是 IPv6 握手失败的真实根因之一）。
 
 ## 构建 & 发布
 - 构建：`wsl bash /mnt/c/Users/root/Pictures/wrt/build_phantun.sh`，产物 → `../build/luci-app-phantun_*.ipk`

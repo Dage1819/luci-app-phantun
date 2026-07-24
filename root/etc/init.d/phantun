@@ -136,7 +136,11 @@ start_rule() {
 			# Clear any stale recorded routes for this rule first, then add the
 			# current peer IP (handles a changed resolution transparently).
 			ph_route_del_cfg "$cfg"
-			ph_route_add "$peer" "$cfg"
+			ph_route_add "$peer" "$cfg" "$name"
+		elif command -v ph_route_del_cfg >/dev/null 2>&1; then
+			# Option turned off (or was never on) -> make sure no stale
+			# exception route from a previous run lingers for this rule.
+			ph_route_del_cfg "$cfg"
 		fi
 
 		[ -z "$local_addr" ] && local_addr="127.0.0.1"

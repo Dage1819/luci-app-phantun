@@ -8,26 +8,34 @@
 # Phantun sends to the server disappears into a not-yet-established tunnel and
 # no SYN+ACK ever comes back.
 #
-# Fix: for client rules that opt in (route_via_wan='1'), install a dedicated
-# routing table holding a default route via the PHYSICAL WAN, plus a high-
-# priority ip rule steering packets destined to the server IP into that table.
-# Only that single destination bypasses the tunnel; everything else still goes
-# through it.
+# Fix: for client rules that opt in (route_via_wan='1'), add a host route for
+# the Phantun server IP via the PHYSICAL WAN interface. Because it is a /32
+# (or /128) host route, it is more specific than the tunnel's default route
+# and wins the lookup in the SAME table -- no dedicated table/ip-rule needed
+# as long as the tunnel's default route lives in the main table (the common
+# case for a WireGuard full-tunnel).
+#
+# These routes are written as regular UCI "config route" / "config route6"
+# sections in /etc/config/network, tagged with a "phantun_<rule>_v4"/"_v6"
+# name and a comment identifying the source rule. This makes them show up in
+# LuCI's own "Network -> Static Routes" page (IPv4 and IPv6 tabs, matching
+# OpenWrt's own separation of the two families) so they are visible and
+# editable through the normal UI, not just via the command line.
 #
 # Because the server address may be a domain whose IP changes over time, the
 # actual resolved IP(s) we install are recorded per-rule in a state file so we
 # can remove *exactly* those on stop / disable / IP-change / uninstall, even if
 # a later resolution returns a different address.
 #
-# Sourced by init.d and monitor.sh. IPv4 and IPv6 are handled separately (v4 ->
-# /32 + v4 WAN gateway; v6 -> /128 + v6 WAN gateway).
+# Sourced by init.d and monitor.sh. IPv4 and IPv6 are handled through separate
+# UCI section types (route / route6), matching how OpenWrt itself keeps them
+# on separate tabs -- never mixed into one section.
 
-PH_ROUTE_TABLE=995
-PH_ROUTE_PREF=102
 PH_ROUTE_STATE_DIR=/var/run/phantun
 
 # Physical WAN logical interface (set by callers from wan_iface UCI option).
-# Empty => "wan".
+# Empty => "wan". This is a *logical* interface name (as used by netifd and
+# by LuCI's own static-route "interface" field), not a device name.
 PH_ROUTE_WAN_IFACE=""
 
 _ph_r_is_v6() {
@@ -40,90 +48,131 @@ _ph_route_wan_iface() {
 	else echo "wan"; fi
 }
 
-# (Re)populate the dedicated table with a default route via the physical WAN,
-# for both address families. Safe to call repeatedly (uses "route replace").
-_ph_route_refresh_wan() {
-	[ -f /lib/functions/network.sh ] || return 1
-	. /lib/functions/network.sh
-	network_flush_cache
-
-	local gw dev gw6
-	local ifc="$(_ph_route_wan_iface)"
-
-	network_get_device dev "$ifc"
-
-	network_get_gateway gw "$ifc"
-	if [ -n "$gw" ] || [ -n "$dev" ]; then
-		ip route replace default ${gw:+via "$gw"} ${dev:+dev "$dev"} \
-			table "$PH_ROUTE_TABLE" 2>/dev/null
-	fi
-
-	network_get_gateway6 gw6 "$ifc"
-	if [ -n "$gw6" ] || [ -n "$dev" ]; then
-		ip -6 route replace default ${gw6:+via "$gw6"} ${dev:+dev "$dev"} \
-			table "$PH_ROUTE_TABLE" 2>/dev/null
-	fi
-	return 0
+# Extract the "via <gw>" of the kernel's own default route on a given device.
+# Used as a fallback when netifd's network_get_gateway(6) comes back empty,
+# which happens with link-local (fe80::) IPv6 gateways and/or source-specific
+# ("from <prefix> via ... dev ...") default routes -- both common on real ISP
+# IPv6 delegations. Parsing the kernel's actual route table is the most
+# reliable source of truth in those cases.
+# $1=family flag for ip ("" for v4, "-6" for v6)  $2=dev
+_ph_route_kernel_gw() {
+	local fam="$1" dev="$2"
+	[ -n "$dev" ] || return 0
+	ip $fam route list default dev "$dev" 2>/dev/null | \
+		awk '{ for (i=1;i<=NF;i++) if ($i=="via") { print $(i+1); exit } }' | head -1
 }
 
-# Add an exception rule for one server IP, recording it under the rule's cfg
-# so it can be removed precisely later.
-# $1=ip  $2=cfg (uci section name)
-ph_route_add() {
-	local ip="$1" cfg="$2"
-	[ -n "$ip" ] || return 0
+# Resolve the physical WAN's device name + v4/v6 gateways. Sets the globals
+# _PH_DEV / _PH_GW / _PH_GW6 (empty string if a gateway is genuinely on-link
+# or could not be determined).
+_ph_route_wan_info() {
+	local ifc="$(_ph_route_wan_iface)"
+	_PH_DEV=""; _PH_GW=""; _PH_GW6=""
 
+	if [ -f /lib/functions/network.sh ]; then
+		. /lib/functions/network.sh
+		network_flush_cache
+		network_get_device _PH_DEV "$ifc"
+		network_get_gateway _PH_GW "$ifc" 2>/dev/null
+		network_get_gateway6 _PH_GW6 "$ifc" 2>/dev/null
+	fi
+	# Fall back to the logical name as the device name if netifd lookup failed.
+	[ -n "$_PH_DEV" ] || _PH_DEV="$ifc"
+
+	# netifd came back empty -> ask the kernel's actual routing table instead.
+	[ -n "$_PH_GW" ]  || _PH_GW=$(_ph_route_kernel_gw ""   "$_PH_DEV")
+	[ -n "$_PH_GW6" ] || _PH_GW6=$(_ph_route_kernel_gw "-6" "$_PH_DEV")
+}
+
+# Add (or replace) the server-exception route for one rule. Writes a named UCI
+# route/route6 section (visible on LuCI's Static Routes page) AND applies it
+# to the kernel immediately, so it takes effect without a full "network"
+# reload (which could be disruptive, e.g. re-dialing PPPoE).
+# $1=ip  $2=cfg (uci section id)  $3=display name (optional, for the comment)
+ph_route_add() {
+	local ip="$1" cfg="$2" name="$3"
+	[ -n "$ip" ] && [ -n "$cfg" ] || return 0
 	mkdir -p "$PH_ROUTE_STATE_DIR" 2>/dev/null
-	_ph_route_refresh_wan
+
+	local ifc="$(_ph_route_wan_iface)"
+	_ph_route_wan_info
 
 	if _ph_r_is_v6 "$ip"; then
-		ip -6 rule del to "$ip" table "$PH_ROUTE_TABLE" pref "$PH_ROUTE_PREF" 2>/dev/null
-		ip -6 rule add to "$ip" table "$PH_ROUTE_TABLE" pref "$PH_ROUTE_PREF" 2>/dev/null
+		local sec="phantun_${cfg}_v6"
+		uci -q delete network."$sec" 2>/dev/null
+		uci set network."$sec"="route6"
+		uci set network."$sec".interface="$ifc"
+		uci set network."$sec".target="${ip}/128"
+		[ -n "$_PH_GW6" ] && uci set network."$sec".gateway="$_PH_GW6"
+		uci set network."$sec".comment="phantun: ${name:-$cfg} (server exception route)"
+		uci commit network
+
+		ip -6 route replace "${ip}/128" ${_PH_GW6:+via "$_PH_GW6"} dev "$_PH_DEV" 2>/dev/null
 	else
-		ip rule del to "$ip" table "$PH_ROUTE_TABLE" pref "$PH_ROUTE_PREF" 2>/dev/null
-		ip rule add to "$ip" table "$PH_ROUTE_TABLE" pref "$PH_ROUTE_PREF" 2>/dev/null
+		local sec="phantun_${cfg}_v4"
+		uci -q delete network."$sec" 2>/dev/null
+		uci set network."$sec"="route"
+		uci set network."$sec".interface="$ifc"
+		uci set network."$sec".target="$ip"
+		uci set network."$sec".netmask="255.255.255.255"
+		[ -n "$_PH_GW" ] && uci set network."$sec".gateway="$_PH_GW"
+		uci set network."$sec".comment="phantun: ${name:-$cfg} (server exception route)"
+		uci commit network
+
+		ip route replace "${ip}/32" ${_PH_GW:+via "$_PH_GW"} dev "$_PH_DEV" 2>/dev/null
 	fi
 
 	# Record (dedup) the IP under this rule for precise teardown.
-	if [ -n "$cfg" ]; then
-		local f="$PH_ROUTE_STATE_DIR/$cfg.route"
-		grep -qxF "$ip" "$f" 2>/dev/null || echo "$ip" >> "$f"
-	fi
-	logger -t phantun "route: server exception $ip -> physical WAN (table $PH_ROUTE_TABLE)"
+	local f="$PH_ROUTE_STATE_DIR/$cfg.route"
+	grep -qxF "$ip" "$f" 2>/dev/null || echo "$ip" >> "$f"
+	logger -t phantun "route: server exception $ip -> physical WAN ($ifc) via static route $sec"
 }
 
-# Remove one IP's exception rule (does not touch the state file).
-_ph_route_del_ip() {
-	local ip="$1"
-	[ -n "$ip" ] || return 0
-	if _ph_r_is_v6 "$ip"; then
-		ip -6 rule del to "$ip" table "$PH_ROUTE_TABLE" pref "$PH_ROUTE_PREF" 2>/dev/null
-	else
-		ip rule del to "$ip" table "$PH_ROUTE_TABLE" pref "$PH_ROUTE_PREF" 2>/dev/null
-	fi
-}
-
-# Remove all exception rules recorded for one rule (cfg) and drop its state.
+# Remove both possible UCI sections (v4/v6) + their kernel routes for one
+# rule, and drop its state file. Safe to call even if nothing was ever added.
 # $1=cfg
 ph_route_del_cfg() {
 	local cfg="$1"
 	[ -n "$cfg" ] || return 0
-	local f="$PH_ROUTE_STATE_DIR/$cfg.route"
-	[ -f "$f" ] || return 0
-	local ip
-	while read -r ip; do
-		[ -n "$ip" ] && _ph_route_del_ip "$ip"
-	done < "$f"
-	rm -f "$f"
+	local changed=0 tgt
+
+	if uci -q get network."phantun_${cfg}_v4" >/dev/null 2>&1; then
+		tgt=$(uci -q get network."phantun_${cfg}_v4".target)
+		uci -q delete network."phantun_${cfg}_v4"
+		[ -n "$tgt" ] && ip route del "${tgt}/32" 2>/dev/null
+		changed=1
+	fi
+	if uci -q get network."phantun_${cfg}_v6" >/dev/null 2>&1; then
+		tgt=$(uci -q get network."phantun_${cfg}_v6".target)
+		uci -q delete network."phantun_${cfg}_v6"
+		[ -n "$tgt" ] && ip -6 route del "$tgt" 2>/dev/null
+		changed=1
+	fi
+	[ "$changed" = "1" ] && uci commit network
+
+	rm -f "$PH_ROUTE_STATE_DIR/$cfg.route"
 }
 
-# Nuke every exception rule/state we ever created (stop-all / uninstall).
+# Nuke every exception route/state we ever created, for every rule (stop-all
+# / uninstall). Finds sections purely by our "phantun_*" naming convention so
+# it also cleans up entries left behind by a renamed/removed rule.
 ph_route_flush_all() {
-	# Delete all ip rules at our pref (loop until none remain), both families.
-	while ip rule del pref "$PH_ROUTE_PREF" 2>/dev/null; do :; done
-	while ip -6 rule del pref "$PH_ROUTE_PREF" 2>/dev/null; do :; done
-	ip route flush table "$PH_ROUTE_TABLE" 2>/dev/null
-	ip -6 route flush table "$PH_ROUTE_TABLE" 2>/dev/null
+	local changed=0 sec tgt
+
+	for sec in $(uci show network 2>/dev/null | sed -n 's/^network\.\(phantun_[^.]*\)=route$/\1/p'); do
+		tgt=$(uci -q get network."$sec".target)
+		uci -q delete network."$sec"
+		[ -n "$tgt" ] && ip route del "${tgt}/32" 2>/dev/null
+		changed=1
+	done
+	for sec in $(uci show network 2>/dev/null | sed -n 's/^network\.\(phantun_[^.]*\)=route6$/\1/p'); do
+		tgt=$(uci -q get network."$sec".target)
+		uci -q delete network."$sec"
+		[ -n "$tgt" ] && ip -6 route del "$tgt" 2>/dev/null
+		changed=1
+	done
+	[ "$changed" = "1" ] && uci commit network
+
 	rm -f "$PH_ROUTE_STATE_DIR"/*.route 2>/dev/null
 	return 0
 }
