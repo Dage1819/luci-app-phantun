@@ -67,6 +67,22 @@ function getCurRepo() {
 	}).catch(function () { return ''; });
 }
 
+// Normalizes any accepted input form (bare "owner/repo", "github.com/...",
+// full URL with/without protocol, trailing "/releases" etc., ".git" suffix)
+// down to "owner/repo".
+function normalizeRepo(v) {
+	return (v || '').replace(/^https?:\/\//, '').replace(/^github\.com\//, '')
+		.replace(/\.git$/, '').split('/').slice(0, 2).join('/');
+}
+
+// "owner/repo" -> full "https://github.com/owner/repo" for display/input,
+// since the repo address should always be shown as a complete, clickable URL
+// rather than the shorthand form.
+function repoToUrl(v) {
+	var norm = normalizeRepo(v);
+	return norm ? 'https://github.com/' + norm : '';
+}
+
 function getLog() {
 	return fs.exec(MANAGE, [ 'log' ]).then(function (res) {
 		return ((res && res.stdout) ? res.stdout : '');
@@ -309,7 +325,7 @@ return view.extend({
 						return;
 					}
 					initState = 'downloading'; notifyInit();
-					showInitLogModal('切换核心来源');
+					showInitLogModal('切换核心仓库');
 					var poller = setInterval(function () {
 						getInitStatus().then(function (st) {
 							if (st === 'ready' || st.indexOf('error:') === 0) {
@@ -414,7 +430,8 @@ return view.extend({
 				var rel = document.getElementById(repoRowId);
 				if (rel && !repoEditing) {
 					rel.innerHTML = '';
-					var repoTxt = curRepo || '（未知）';
+					var repoUrl = repoToUrl(curRepo);
+					var repoTxt = repoUrl || '（未知）';
 					if (repoSwitching) {
 						rel.appendChild(E('span', { 'style': 'font-family:monospace;margin-right:12px' }, repoTxt));
 						rel.appendChild(E('span', { 'class': 'spinning' }, ' 切换中…'));
@@ -442,7 +459,7 @@ return view.extend({
 				var input = E('input', {
 					'type': 'text',
 					'style': 'width:420px;font-family:monospace',
-					'value': curRepo || '',
+					'value': repoToUrl(curRepo) || '',
 					'placeholder': 'https://github.com/owner/repo 或 owner/repo'
 				});
 				var cancel = function () {
@@ -459,9 +476,9 @@ return view.extend({
 					var curNorm = (curRepo || '').replace(/^https?:\/\//, '').replace(/^github\.com\//, '')
 						.replace(/\.git$/, '').split('/').slice(0, 2).join('/');
 					if (norm === curNorm) { repoEditing = false; renderStatus(); return; }
-					ui.showModal('切换核心来源', [
+					ui.showModal('切换核心仓库', [
 						E('p', {}, '仓库地址已更改为：'),
-						E('p', { 'style': 'font-family:monospace;font-weight:600' }, norm),
+						E('p', { 'style': 'font-family:monospace;font-weight:600' }, repoToUrl(norm)),
 						E('p', { 'style': 'color:#c62828' },
 							'确认后将立即从新仓库重新下载并替换当前的 phantun_server / phantun_client，' +
 							'服务端与客户端需使用同一来源，否则可能因协议实现差异导致无法握手。是否继续？'),
@@ -514,7 +531,7 @@ return view.extend({
 					E('div', { 'class': 'cbi-value-field', 'id': versionRowId }, E('em', {}, '…'))
 				]),
 				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, '核心来源'),
+					E('label', { 'class': 'cbi-value-title' }, '核心仓库'),
 					E('div', { 'class': 'cbi-value-field', 'id': repoRowId }, E('em', {}, '…'))
 				])
 			]);
