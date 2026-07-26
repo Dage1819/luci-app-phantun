@@ -38,7 +38,7 @@ LuCI 界面插件，管理 [Phantun](https://github.com/dndx/phantun)（UDP over
 - `htdocs/luci-static/resources/view/phantun/phantun.js` — 前端（状态卡/初始化弹窗/规则表/poll实时刷新）
 
 ## 当前版本
-v1.2.2（PKG_VERSION 在 Makefile）
+v1.3.0（PKG_VERSION 在 Makefile）
 
 ### v1.2.0 变更
 - 新增「服务端例外路由」（客户端选项，默认关）：WireGuard 全局代理场景下，为 Phantun 服务端 IP 添加走物理 WAN 的例外路由，破解「隧道要靠自己才能建立」的死锁。
@@ -52,6 +52,20 @@ v1.2.2（PKG_VERSION 在 Makefile）
 ### v1.2.2 变更
 - **例外路由改为写 OpenWrt 标准静态路由**（`/etc/config/network` 的 `config route` / `config route6`），不再用独立路由表995 + ip rule。原因：用户环境的隧道默认路由本身就在 main 表，/32 或 /128 明细路由凭最长前缀匹配即可稳定压过 /0 默认路由，且写成标准静态路由后能直接在 LuCI「网络 → 静态路由」页面（IPv4/IPv6 分 tab，与 OpenWrt 原生一致）看到、手动核对、编辑，可管理性大幅提升。UCI 段命名 `phantun_<规则名>_v4`/`_v6`，`comment` 字段标注来源规则，卸载/停止/取消勾选/IP变化时精确删除对应段。
 - 网关解析加内核路由表兜底：`network_get_gateway(6)` 在「网关是 link-local 地址」或「多条 source-specific 默认路由」的环境下可能取不到值，此时回退去解析 `ip [-6] route list default dev <wan>` 的实际 `via`，避免网关为空导致 on-link 路由（会在邻居解析阶段丢包，是 IPv6 握手失败的真实根因之一）。
+
+### v1.3.0 变更（诊断可见性）
+- **握手状态**：规则列表「状态」列，运行中的规则下方新增一行，基于 `/proc/net/nf_conntrack` 实时判断：`握手成功`(ESTABLISHED) / `握手中…`(SYN_SENT/SYN_RECV) / `未连接`。不依赖日志时间点，反映当前这一刻的真实连接状态。
+- **查看日志**（点击握手状态旁的链接）：弹窗展示该规则的过滤后日志（最近 100 条），只保留 ERROR/超时/连接关闭/无法解析/启动信息等有意义的事件，把每次重试都会刷的噪音（`Sent SYN to server`、`New UDP client from ...`）过滤掉。**不改 phantun 自身日志级别**（仍用 info，保证异常都被记录），过滤只在展示层做。已知限制：phantun 进程日志按二进制名（phantun_client/phantun_server）打 syslog tag，不按规则名区分，同一 mode 跑多条规则时日志无法在插件层面分开——这是 phantun 自身日志设计的限制。
+- **域名解析 IP 显示**：客户端规则若 remote 为域名，目标列下方显示当前实际解析并传给 phantun 的 IP（`→ 解析为 x.x.x.x`），来自 init.d 写入的状态文件 `/var/run/phantun/<cfg>.resolved`，重新解析（含域名监控触发的）会同步更新。
+- 后端新增 `manage.sh` 子命令：`rule_conn <name>`、`rule_resolved <name>`、`rule_log <name>`，均按规则名反查 uci 段，无需改动 ACL（已有 `manage.sh *` 通配授权）。
+
+## 已知问题 / 待查（IPv6 场景，跨会话记录）
+排查过一次「客户端 phantun v6 握手失败」的故障，结论：
+- 客户端 SYN confirmed 送达服务器（服务端 conntrack 看到正确的公网源地址），服务器正确回复 SYN+ACK（服务端日志/conntrack 均证实），但客户端从未收到该 SYN+ACK（客户端 conntrack 显示 `[UNREPLIED]`）。
+- 依次排除：例外路由网关漂移（网关核对一致）、WAN 地址 deprecated（preferred_lft 健康）、上级路由器 SLAAC 缺 DHCPv6-PD（切 Stateful DHCPv6 后 `Failed to assign subprefix` 报错依旧）、重启设备（无效）。
+- 最终结论：问题在客户端-服务器之间的公网路径（运营商骨干网或中间设备丢弃了回程包），双方本地配置均已验证正常，非插件/UCI 配置可解决。v4 全程稳定。
+- 无 tcpdump 环境下的排查手段：`/proc/net/nf_conntrack` grep 目标端口/地址（比 `logread` 更能反映实时状态，能看到 `[UNREPLIED]`、`ESTABLISHED`、`SYN_SENT` 等）；两端交叉对比是关键，单端日志容易得出片面结论。
+- 本次新增的握手状态/日志弹窗功能正是为了让这类排查在网页端更快看到「卡在哪一步」，但**跨设备网络路径问题仍需人工登录两端交叉核对，UI 无法自动化诊断这一层**。
 
 ## 构建 & 发布
 - 构建：`wsl bash /mnt/c/Users/root/Pictures/wrt/build_phantun.sh`，产物 → `../build/luci-app-phantun_*.ipk`

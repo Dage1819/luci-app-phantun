@@ -3,6 +3,11 @@
 # asynchronous initialization (download + extract), version tracking,
 # update checking, and a rolling init log the web UI streams in real time.
 #
+# Also provides per-rule diagnostics for the web UI: live handshake status
+# (from conntrack), the currently-resolved peer IP for domain-based client
+# rules, and a filtered error/event log (noise like per-connection churn
+# stripped out, so the UI shows only lines that actually indicate a problem).
+#
 # Download strategy (all via curl):
 #   1. Concurrent HEAD race across mirrors -> pick the fastest responder.
 #   2. Download from the winner using a STALL timeout (never a total timeout),
@@ -12,6 +17,7 @@
 # Usage:
 #   manage.sh status | init | update [tag] | init_status
 #   manage.sh cur_version | check_update | log
+#   manage.sh rule_conn <name> | rule_resolved <name> | rule_log <name>
 
 BIN_DIR=/usr/bin
 SERVER_BIN="$BIN_DIR/phantun_server"
@@ -21,6 +27,7 @@ LOG_FILE=/tmp/phantun_init.log
 LOG_MAX=100
 TMP_DIR=/tmp/phantun_dl
 VERSION_FILE=/usr/share/phantun/.version
+RUN_STATE_DIR=/var/run/phantun
 
 PHANTUN_VERSION="v0.8.1"
 if command -v uci >/dev/null 2>&1; then
@@ -320,13 +327,104 @@ cmd_update() {
 	start_async "$ver"
 }
 
+# ---- Per-rule diagnostics for the web UI ----
+#
+# Look up the uci rule section whose "name" option matches $1 (falling back
+# to treating $1 as the section id itself), and echo "mode|local_port|remote_port".
+_rule_lookup() {
+	local want="$1"
+	local found="" fmode="" flp="" frp=""
+	_match() {
+		local cfg="$1" nm mode lp rp
+		[ -z "$found" ] || return 0
+		config_get nm "$cfg" name "$cfg"
+		[ "$nm" = "$want" ] || return 0
+		config_get mode "$cfg" mode "client"
+		config_get lp "$cfg" local_port ""
+		config_get rp "$cfg" remote_port ""
+		found="$cfg"; fmode="$mode"; flp="$lp"; frp="$rp"
+	}
+	config_load phantun
+	config_foreach _match rule
+	[ -n "$found" ] && echo "${found}|${fmode}|${flp}|${frp}"
+}
+
+# Handshake/connection status for one rule, derived from live conntrack
+# state rather than log parsing, so it reflects the current moment rather
+# than something that may have happened minutes ago.
+# Output: one of established | handshaking | none
+cmd_rule_conn() {
+	local name="$1"
+	[ -n "$name" ] || { echo "none"; return 0; }
+	local info; info=$(_rule_lookup "$name")
+	[ -n "$info" ] || { echo "none"; return 0; }
+	local mode lp rp
+	mode=$(echo "$info" | cut -d'|' -f2)
+	lp=$(echo "$info" | cut -d'|' -f3)
+	rp=$(echo "$info" | cut -d'|' -f4)
+
+	# Server listens on local_port; client connects out to remote_port. Either
+	# way the TCP port of interest shows up as "dport=<port>" on the original
+	# (request) direction of the conntrack entry.
+	local port
+	if [ "$mode" = "server" ]; then port="$lp"; else port="$rp"; fi
+	[ -n "$port" ] || { echo "none"; return 0; }
+
+	local lines
+	lines=$(grep "dport=${port} " /proc/net/nf_conntrack 2>/dev/null)
+	[ -n "$lines" ] || { echo "none"; return 0; }
+
+	if echo "$lines" | grep -q "ESTABLISHED"; then
+		echo "established"
+	elif echo "$lines" | grep -qE "SYN_SENT|SYN_RECV"; then
+		echo "handshaking"
+	else
+		echo "none"
+	fi
+}
+
+# Currently-resolved peer IP for a domain-based client rule (written by
+# init.d's start_rule each time it resolves). Empty output if the rule's
+# remote is a literal IP (nothing to resolve) or has never started.
+cmd_rule_resolved() {
+	local name="$1"
+	[ -n "$name" ] || { echo ""; return 0; }
+	local info; info=$(_rule_lookup "$name")
+	local cfg; cfg=$(echo "$info" | cut -d'|' -f1)
+	[ -n "$cfg" ] && [ -f "$RUN_STATE_DIR/$cfg.resolved" ] && cat "$RUN_STATE_DIR/$cfg.resolved" || echo ""
+}
+
+# Filtered, most-recent log lines for one rule: only lines that indicate an
+# actual event (error, timeout, connection closed, startup info) -- the
+# per-attempt noise ("Sent SYN to server", "New UDP client from ...", which
+# repeat every retry/reconnect) is stripped so the modal only shows what
+# matters. Caveat: procd/syslog tags phantun's own stdout by binary name
+# (phantun_client / phantun_server), not by rule name, so if you run more
+# than one rule of the same mode their logs are not distinguishable here --
+# this is a logging limitation of phantun itself, not something the UI can
+# work around without changing how phantun logs.
+cmd_rule_log() {
+	local name="$1"
+	[ -n "$name" ] || { echo ""; return 0; }
+	local info; info=$(_rule_lookup "$name")
+	[ -n "$info" ] || { echo ""; return 0; }
+	local mode; mode=$(echo "$info" | cut -d'|' -f2)
+	local tag; [ "$mode" = "server" ] && tag="phantun_server" || tag="phantun_client"
+
+	local keep='ERROR|timed out|Unable to connect|cannot resolve|closed|Created TUN|Remote address is|listening|denied|refused|panic'
+	logread -e "$tag" 2>/dev/null | grep -E "$keep" | tail -100
+}
+
 case "$1" in
-	status)       cmd_status ;;
-	init)         cmd_init ;;
-	update)       cmd_update "$2" ;;
-	init_status)  cmd_init_status ;;
-	cur_version)  cmd_cur_version ;;
-	check_update) cmd_check_update ;;
-	log)          cmd_log ;;
-	*)            echo "usage: $0 {status|init|update|init_status|cur_version|check_update|log}" >&2; exit 1 ;;
+	status)        cmd_status ;;
+	init)          cmd_init ;;
+	update)        cmd_update "$2" ;;
+	init_status)   cmd_init_status ;;
+	cur_version)   cmd_cur_version ;;
+	check_update)  cmd_check_update ;;
+	log)           cmd_log ;;
+	rule_conn)     cmd_rule_conn "$2" ;;
+	rule_resolved) cmd_rule_resolved "$2" ;;
+	rule_log)      cmd_rule_log "$2" ;;
+	*)             echo "usage: $0 {status|init|update|init_status|cur_version|check_update|log|rule_conn|rule_resolved|rule_log}" >&2; exit 1 ;;
 esac

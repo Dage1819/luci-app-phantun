@@ -125,6 +125,12 @@ start_rule() {
 			fi
 		fi
 
+		# Persist the address actually being used (literal or resolved) so
+		# the web UI can show "currently resolved/used IP" under domain-based
+		# rules without re-resolving itself.
+		mkdir -p /var/run/phantun 2>/dev/null
+		echo "$peer" > "/var/run/phantun/${cfg}.resolved" 2>/dev/null
+
 		# Server exception route (opt-in): when the box's default route points
 		# into a tunnel (WireGuard full-tunnel), steer traffic to the Phantun
 		# server IP out the physical WAN so it does not deadlock inside the

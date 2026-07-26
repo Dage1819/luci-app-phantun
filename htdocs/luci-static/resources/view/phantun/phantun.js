@@ -23,6 +23,12 @@ var transient = {};
 var rowUpdaters = [];
 var pollStarted = false;
 
+// Per-rule diagnostics (handshake status, resolved peer IP), keyed by rule
+// name. Refreshed on the same 2s poll as everything else, but only for rules
+// that are actually running (no point querying conntrack for a dead rule).
+var connCache = {};
+var resolvedCache = {};
+
 var initState = 'unknown';
 var curVersion = '';
 var latestVersion = '';
@@ -54,6 +60,56 @@ function getLog() {
 	return fs.exec(MANAGE, [ 'log' ]).then(function (res) {
 		return ((res && res.stdout) ? res.stdout : '');
 	}).catch(function () { return ''; });
+}
+
+// Live handshake status for one rule, from conntrack (not log parsing), so
+// it always reflects the current moment. One of: established | handshaking
+// | none.
+function getRuleConn(name) {
+	return fs.exec(MANAGE, [ 'rule_conn', name ]).then(function (res) {
+		return ((res && res.stdout) ? res.stdout : '').trim() || 'none';
+	}).catch(function () { return 'none'; });
+}
+
+// Currently-resolved peer IP for a domain-based client rule (empty if the
+// remote is a literal IP, or the rule has never started).
+function getRuleResolved(name) {
+	return fs.exec(MANAGE, [ 'rule_resolved', name ]).then(function (res) {
+		return ((res && res.stdout) ? res.stdout : '').trim();
+	}).catch(function () { return ''; });
+}
+
+// Filtered, most-recent (up to 100) log lines for one rule: startup/error/
+// timeout/close events only, per-attempt noise stripped out.
+function getRuleLog(name) {
+	return fs.exec(MANAGE, [ 'rule_log', name ]).then(function (res) {
+		return ((res && res.stdout) ? res.stdout : '');
+	}).catch(function () { return ''; });
+}
+
+// Show a read-only modal with one rule's filtered log (most recent 100
+// lines that indicate an actual event, not per-connection churn).
+function showRuleLogModal(name) {
+	var logId = 'ph_rule_log_' + name;
+	var pre = E('pre', {
+		'id': logId,
+		'style': 'max-height:400px;overflow:auto;background:#1e1e1e;color:#d4d4d4;' +
+			'padding:12px;border-radius:6px;font-size:12px;line-height:1.5;white-space:pre-wrap;margin:0'
+	}, '加载中…');
+
+	ui.showModal('规则日志：' + name, [
+		E('p', { 'style': 'color:#666;font-size:12px;margin-top:0' },
+			'仅显示错误、超时、连接建立/关闭等有意义的事件（最近 100 条），已过滤掉正常的逐次重试噪音。'),
+		pre,
+		E('div', { 'class': 'right', 'style': 'margin-top:12px' }, [
+			E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': ui.hideModal }, '关闭')
+		])
+	]);
+
+	getRuleLog(name).then(function (text) {
+		var el = document.getElementById(logId);
+		if (el) el.textContent = text || '（暂无相关日志）';
+	});
 }
 
 // Show a modal that streams the init/update log in real time until the
@@ -107,6 +163,11 @@ function showInitLogModal(title) {
 function notifyInit() { initUpdaters.forEach(function (fn) { try { fn(); } catch (e) {} }); }
 function notifyRows() { rowUpdaters.forEach(function (fn) { try { fn(); } catch (e) {} }); }
 
+// All rule names known to the current form (populated once in render()), so
+// refreshAll() knows which rules to query for handshake status / resolved IP
+// without re-reading uci on every poll tick.
+var allRuleNames = [];
+
 function refreshAll() {
 	return Promise.all([ getInitStatus(), getStatus(), getCurVersion() ]).then(function (r) {
 		initState = r[0] || 'missing';
@@ -114,6 +175,20 @@ function refreshAll() {
 		curVersion = r[2] || 'none';
 		notifyInit();
 		notifyRows();
+
+		// Second wave: per-rule diagnostics, only for rules currently running
+		// (querying conntrack/resolved-IP for a stopped rule is meaningless).
+		// Fired after the main state so the basic running/stopped label is
+		// never blocked waiting on these extra shell calls.
+		var running = allRuleNames.filter(isRunning);
+		if (running.length) {
+			Promise.all(running.map(function (name) {
+				return Promise.all([ getRuleConn(name), getRuleResolved(name) ]).then(function (rr) {
+					connCache[name] = rr[0];
+					resolvedCache[name] = rr[1];
+				});
+			})).then(notifyRows);
+		}
 		return true;
 	});
 }
@@ -360,6 +435,7 @@ return view.extend({
 		o.modalonly = false;
 		o.textvalue = function (section_id) {
 			var mode = uci.get('phantun', section_id, 'mode') || 'client';
+			var name = uci.get('phantun', section_id, 'name') || section_id;
 			if (mode === 'server') {
 				var lp = uci.get('phantun', section_id, 'local_port') || '?';
 				var ra = uci.get('phantun', section_id, 'remote_addr') || '127.0.0.1';
@@ -370,7 +446,28 @@ return view.extend({
 				var lp2 = uci.get('phantun', section_id, 'local_port') || '?';
 				var ra2 = uci.get('phantun', section_id, 'remote_addr') || '?';
 				var rp2 = uci.get('phantun', section_id, 'remote_port') || '?';
-				return 'UDP %s:%s → %s:%s'.format(la, lp2, ra2, rp2);
+				var line1 = 'UDP %s:%s → %s:%s'.format(la, lp2, ra2, rp2);
+
+				// If the remote is a domain, show the IP actually resolved and
+				// in use (updated on the same poll cycle, from init.d's record
+				// of what it passed to phantun -- not a fresh DNS lookup).
+				var isDomain = ra2 && !/^[0-9.]+$/.test(ra2) && !/:/.test(ra2);
+				if (!isDomain) return line1;
+
+				var resId = 'res_' + section_id;
+				var upd = function () {
+					var el = document.getElementById(resId);
+					if (!el) return;
+					var ip = resolvedCache[name];
+					el.textContent = ip ? ('当前解析：' + ip) : '当前解析：—';
+				};
+				rowUpdaters.push(upd);
+				ensurePoll();
+				requestAnimationFrame(upd);
+				return E('div', {}, [
+					E('div', {}, line1),
+					E('div', { 'id': resId, 'style': 'font-size:12px;color:#666;margin-top:2px' }, '当前解析：—')
+				]);
 			}
 		};
 
@@ -378,7 +475,9 @@ return view.extend({
 		o.modalonly = false;
 		o.textvalue = function (section_id) {
 			var name = uci.get('phantun', section_id, 'name') || section_id;
+			if (allRuleNames.indexOf(name) === -1) allRuleNames.push(name);
 			var stId = 'st_' + section_id;
+			var connId = 'cn_' + section_id;
 			var actId = 'act_' + section_id;
 
 			var mkBtn = function (label, cls, action, disabled) {
@@ -388,10 +487,25 @@ return view.extend({
 				return E('button', attrs, label);
 			};
 
+			// Handshake status line: only meaningful while the rule is running.
+			// established = tunnel actually passing traffic; handshaking = TCP
+			// SYN/SYN-ACK seen but not completed (stuck, e.g. reply not
+			// arriving back); no entry yet -> conntrack has nothing for this
+			// rule's port at all.
+			var connInfo = function (running) {
+				if (!running) return null;
+				var c = connCache[name];
+				if (c === 'established') return { text: '握手成功', color: '#2e7d32' };
+				if (c === 'handshaking') return { text: '握手中…', color: '#ef6c00' };
+				if (c === 'none') return { text: '未连接', color: '#999' };
+				return null; // not fetched yet
+			};
+
 			var updater = function () {
 				var stEl = document.getElementById(stId);
+				var connEl = document.getElementById(connId);
 				var actEl = document.getElementById(actId);
-				if (!stEl && !actEl) return;
+				if (!stEl && !connEl && !actEl) return;
 				var t = transient[name];
 				var running = isRunning(name);
 				if (stEl) {
@@ -399,6 +513,19 @@ return view.extend({
 					else stEl.innerHTML = running
 						? '<span style="color:#2e7d32"><strong>运行中</strong></span>'
 						: '<span style="color:#999">已停止</span>';
+				}
+				if (connEl) {
+					var ci = connInfo(running && !t);
+					if (ci) {
+						connEl.innerHTML = '';
+						connEl.appendChild(E('span', { 'style': 'font-size:12px;color:' + ci.color }, ci.text));
+						connEl.appendChild(E('a', {
+							'href': '#', 'style': 'font-size:12px;margin-left:8px;color:#337ab7',
+							'click': function (ev) { ev.preventDefault(); showRuleLogModal(name); }
+						}, '查看日志'));
+					} else {
+						connEl.innerHTML = '';
+					}
 				}
 				if (actEl) {
 					var busy = !!t;
@@ -412,7 +539,10 @@ return view.extend({
 			rowUpdaters.push(updater);
 			ensurePoll();
 			requestAnimationFrame(updater);
-			return E('span', { 'id': stId }, '…');
+			return E('div', {}, [
+				E('div', { 'id': stId }, '…'),
+				E('div', { 'id': connId, 'style': 'margin-top:2px' })
+			]);
 		};
 
 		o = s.option(form.DummyValue, '_actions', '操作');
