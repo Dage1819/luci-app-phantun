@@ -16,8 +16,9 @@
 #
 # Usage:
 #   manage.sh status | init | update [tag] | init_status
-#   manage.sh cur_version | check_update | log
+#   manage.sh cur_version | cur_repo | check_update | log
 #   manage.sh rule_conn <name> | rule_resolved <name> | rule_log <name>
+#   manage.sh switch_repo <owner/repo> [tag]
 
 . /lib/functions.sh
 
@@ -29,13 +30,45 @@ LOG_FILE=/tmp/phantun_init.log
 LOG_MAX=100
 TMP_DIR=/tmp/phantun_dl
 VERSION_FILE=/usr/share/phantun/.version
+REPO_FILE=/usr/share/phantun/.repo
 RUN_STATE_DIR=/var/run/phantun
 
-PHANTUN_VERSION="v0.8.1"
+# Default source repo is this project's own fork (adds the opt-in --time TCP
+# fingerprint flag on top of upstream, see fake-tcp changes), not the
+# upstream dndx/phantun. Both are plain "owner/repo" GitHub paths; switching
+# is fully supported (see cmd_switch_repo) since the download/update logic
+# below never hardcodes which repo it talks to.
+DEFAULT_REPO="Dage1819/phantun"
+PHANTUN_REPO="$DEFAULT_REPO"
+if command -v uci >/dev/null 2>&1; then
+	_r=$(uci -q get phantun.global.repo 2>/dev/null)
+	[ -n "$_r" ] && PHANTUN_REPO="$_r"
+fi
+
+PHANTUN_VERSION="v0.8.1-fp1"
 if command -v uci >/dev/null 2>&1; then
 	_v=$(uci -q get phantun.global.version 2>/dev/null)
 	[ -n "$_v" ] && PHANTUN_VERSION="$_v"
 fi
+
+# Accepts either a bare "owner/repo" or a full GitHub URL in any of these
+# forms and normalizes to "owner/repo":
+#   owner/repo
+#   github.com/owner/repo
+#   https://github.com/owner/repo
+#   https://github.com/owner/repo/releases
+#   https://github.com/owner/repo/releases/tag/vX.Y.Z
+#   https://github.com/owner/repo.git
+normalize_repo() {
+	local in="$1"
+	in="${in#https://}"
+	in="${in#http://}"
+	in="${in#github.com/}"
+	in="${in%.git}"
+	# Keep only the first two path segments (owner/repo), drop anything
+	# after (e.g. /releases, /releases/tag/vX, /tree/main, trailing slash).
+	echo "$in" | cut -d'/' -f1-2
+}
 
 # Acceleration mirrors. Each is prepended to the full "https://github.com/..."
 # URL. The last (empty) entry means a direct GitHub connection as a fallback.
@@ -99,17 +132,29 @@ cmd_cur_version() {
 	else echo "none"; fi
 }
 
-# Query GitHub for the latest release tag; print "latest|<tag>|<newer>".
+# The repo the currently-installed binaries actually came from (may differ
+# from $PHANTUN_REPO if the uci setting was changed but switch_repo has not
+# been run yet -- the UI uses this, not the uci value, to detect that case).
+# Falls back to the configured/default repo when nothing has been installed
+# yet, so a first-time "check update" before init still checks the right place.
+cmd_cur_repo() {
+	if [ -f "$REPO_FILE" ]; then cat "$REPO_FILE"
+	else echo "$PHANTUN_REPO"; fi
+}
+
+# Query GitHub for the latest release tag of $1 (owner/repo, defaults to the
+# configured repo); print "latest|<tag>|<newer>".
 cmd_check_update() {
+	local repo="${1:-$PHANTUN_REPO}"
 	local body latest cur m
-	local apiurl="https://api.github.com/repos/dndx/phantun/releases/latest"
+	local apiurl="https://api.github.com/repos/${repo}/releases/latest"
 	body=""
 	for m in $MIRRORS ""; do
 		body=$(curl -fsL --connect-timeout 8 -m 20 "${m}${apiurl}" 2>/dev/null)
 		[ -n "$body" ] && break
 	done
 	if [ -z "$body" ]; then
-		latest=$(curl -fsL --connect-timeout 8 -m 20 "https://github.com/dndx/phantun/releases/latest" 2>/dev/null | grep -o 'tag/v[0-9.]*' | head -1 | sed 's,tag/,,')
+		latest=$(curl -fsL --connect-timeout 8 -m 20 "https://github.com/${repo}/releases/latest" 2>/dev/null | grep -o 'tag/v[0-9.]*[^"]*' | head -1 | sed 's,tag/,,')
 	else
 		latest=$(echo "$body" | grep -o '"tag_name"[ ]*:[ ]*"[^"]*"' | head -1 | sed 's/.*"tag_name"[ ]*:[ ]*"//;s/"//')
 	fi
@@ -189,10 +234,11 @@ download_with_progress() {
 
 do_download() {
 	local ver="$1"
+	local repo="${2:-$PHANTUN_REPO}"
 	local target ghpath total winner url
 	[ -n "$ver" ] || ver="$PHANTUN_VERSION"
 
-	log "开始初始化 Phantun $ver"
+	log "开始初始化 Phantun $ver（仓库：$repo）"
 	log "检测系统架构：$(uname -m)"
 	target=$(detect_target)
 	if [ -z "$target" ]; then
@@ -204,7 +250,7 @@ do_download() {
 	set_state "downloading"
 	rm -rf "$TMP_DIR"; mkdir -p "$TMP_DIR"
 	local zip="$TMP_DIR/phantun_${target}.zip"
-	ghpath="https://github.com/dndx/phantun/releases/download/${ver}/phantun_${target}.zip"
+	ghpath="https://github.com/${repo}/releases/download/${ver}/phantun_${target}.zip"
 
 	# 1) Concurrent header race to pick the fastest mirror.
 	log "正在并发测速，选择最佳节点…"
@@ -289,7 +335,8 @@ do_download() {
 	if [ -x "$SERVER_BIN" ] && [ -x "$CLIENT_BIN" ]; then
 		mkdir -p "$(dirname "$VERSION_FILE")" 2>/dev/null
 		echo "$ver" > "$VERSION_FILE"
-		log "安装完成，Phantun $ver 已就绪"
+		echo "$repo" > "$REPO_FILE"
+		log "安装完成，Phantun $ver 已就绪（仓库：$repo）"
 		set_state "ready"
 	else
 		log "错误：安装后未检测到可执行文件（磁盘空间不足？）"
@@ -298,8 +345,10 @@ do_download() {
 	fi
 }
 
+# $1=version tag  $2=owner/repo (defaults to configured repo)
 start_async() {
 	local ver="$1"
+	local repo="${2:-$PHANTUN_REPO}"
 	if [ -f "$STATE_FILE" ]; then
 		local cur; cur=$(cat "$STATE_FILE")
 		case "$cur" in
@@ -308,7 +357,7 @@ start_async() {
 	fi
 	log_reset
 	set_state "downloading"
-	( do_download "$ver" ) >/dev/null 2>&1 &
+	( do_download "$ver" "$repo" ) >/dev/null 2>&1 &
 	echo "started"
 }
 
@@ -316,17 +365,40 @@ cmd_init() {
 	if [ -x "$SERVER_BIN" ] && [ -x "$CLIENT_BIN" ]; then
 		set_state "ready"; echo "ready"; return 0
 	fi
-	start_async "$PHANTUN_VERSION"
+	start_async "$PHANTUN_VERSION" "$PHANTUN_REPO"
 }
 
 cmd_update() {
 	local ver="$1"
 	if [ -z "$ver" ]; then
-		local r; r=$(cmd_check_update)
+		local r; r=$(cmd_check_update "$PHANTUN_REPO")
 		ver=$(echo "$r" | cut -d'|' -f2)
 	fi
 	[ -n "$ver" ] || { echo "error:no_version"; return 1; }
-	start_async "$ver"
+	start_async "$ver" "$PHANTUN_REPO"
+}
+
+# Switch to a different source repo and immediately re-initialize: downloads
+# the given (or latest, if omitted) release from the new repo and replaces
+# the installed binaries. $1=owner/repo or full GitHub URL (normalized via
+# normalize_repo), $2=optional version tag (defaults to that repo's latest
+# release). Does NOT touch uci -- the web UI is responsible for persisting
+# the new repo setting only after this call succeeds, so an aborted/failed
+# switch never leaves the saved config pointing at a repo whose binaries
+# were not actually installed.
+cmd_switch_repo() {
+	local repo; repo=$(normalize_repo "$1")
+	[ -n "$repo" ] && [ "$repo" != "/" ] || { echo "error:bad_repo"; return 1; }
+	local ver="$2"
+	if [ -z "$ver" ]; then
+		local r; r=$(cmd_check_update "$repo")
+		if [ "$r" = "error" ]; then
+			echo "error:no_release"; return 1
+		fi
+		ver=$(echo "$r" | cut -d'|' -f2)
+	fi
+	[ -n "$ver" ] || { echo "error:no_version"; return 1; }
+	start_async "$ver" "$repo"
 }
 
 # ---- Per-rule diagnostics for the web UI ----
@@ -432,10 +504,12 @@ case "$1" in
 	update)        cmd_update "$2" ;;
 	init_status)   cmd_init_status ;;
 	cur_version)   cmd_cur_version ;;
-	check_update)  cmd_check_update ;;
+	cur_repo)      cmd_cur_repo ;;
+	check_update)  cmd_check_update "$2" ;;
 	log)           cmd_log ;;
 	rule_conn)     cmd_rule_conn "$2" ;;
 	rule_resolved) cmd_rule_resolved "$2" ;;
 	rule_log)      cmd_rule_log "$2" ;;
-	*)             echo "usage: $0 {status|init|update|init_status|cur_version|check_update|log|rule_conn|rule_resolved|rule_log}" >&2; exit 1 ;;
+	switch_repo)   cmd_switch_repo "$2" "$3" ;;
+	*)             echo "usage: $0 {status|init|update|init_status|cur_version|cur_repo|check_update|log|rule_conn|rule_resolved|rule_log|switch_repo}" >&2; exit 1 ;;
 esac

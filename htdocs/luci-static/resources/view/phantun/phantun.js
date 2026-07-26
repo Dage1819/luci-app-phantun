@@ -31,9 +31,12 @@ var resolvedCache = {};
 
 var initState = 'unknown';
 var curVersion = '';
+var curRepo = '';
 var latestVersion = '';
 var hasUpdate = false;
 var checking = false;
+var repoEditing = false;
+var repoSwitching = false;
 var initUpdaters = [];
 
 function getStatus() {
@@ -54,6 +57,14 @@ function getCurVersion() {
 	return fs.exec(MANAGE, [ 'cur_version' ]).then(function (res) {
 		return ((res && res.stdout) ? res.stdout : '').trim() || 'none';
 	}).catch(function () { return 'none'; });
+}
+
+// The repo the currently-installed binaries actually came from (not
+// necessarily what's saved in uci -- see switch_repo flow below).
+function getCurRepo() {
+	return fs.exec(MANAGE, [ 'cur_repo' ]).then(function (res) {
+		return ((res && res.stdout) ? res.stdout : '').trim();
+	}).catch(function () { return ''; });
 }
 
 function getLog() {
@@ -169,10 +180,13 @@ function notifyRows() { rowUpdaters.forEach(function (fn) { try { fn(); } catch 
 var allRuleNames = [];
 
 function refreshAll() {
-	return Promise.all([ getInitStatus(), getStatus(), getCurVersion() ]).then(function (r) {
+	return Promise.all([ getInitStatus(), getStatus(), getCurVersion(), getCurRepo() ]).then(function (r) {
 		initState = r[0] || 'missing';
 		statusCache = r[1] || {};
 		curVersion = r[2] || 'none';
+		// Don't clobber the repo input while the user is actively editing it
+		// (a poll tick landing mid-edit would otherwise reset their typing).
+		if (!repoEditing) curRepo = r[3] || '';
 		notifyInit();
 		notifyRows();
 
@@ -279,6 +293,42 @@ return view.extend({
 			var self = this;
 			var statusRowId = 'ph_status_row';
 			var versionRowId = 'ph_version_row';
+			var repoRowId = 'ph_repo_row';
+
+			// Switch to a different source repo: confirm, then download+
+			// install from the new repo, and only persist it to uci once
+			// that has actually succeeded (so uci never points at a repo
+			// whose binaries were not actually installed).
+			var doSwitchRepo = function (newRepo) {
+				repoSwitching = true; notifyInit();
+				return fs.exec(MANAGE, [ 'switch_repo', newRepo ]).then(function (res) {
+					var out = ((res && res.stdout) ? res.stdout : '').trim();
+					if (out.indexOf('error:') === 0) {
+						repoSwitching = false; notifyInit();
+						ui.addNotification(null, E('p', {}, '切换仓库失败：%s'.format(out)), 'error');
+						return;
+					}
+					initState = 'downloading'; notifyInit();
+					showInitLogModal('切换核心来源');
+					var poller = setInterval(function () {
+						getInitStatus().then(function (st) {
+							if (st === 'ready' || st.indexOf('error:') === 0) {
+								clearInterval(poller);
+								repoSwitching = false;
+								if (st === 'ready') {
+									return uci.set('phantun', 'global', 'repo', newRepo).then(function () {
+										return uci.save();
+									}).then(refreshAll).then(notifyInit);
+								}
+								refreshAll(); notifyInit();
+							}
+						});
+					}, 1000);
+				}).catch(function (e) {
+					repoSwitching = false; notifyInit();
+					ui.addNotification(null, E('p', {}, '切换仓库失败：%s'.format(e.message || e)), 'error');
+				});
+			};
 
 			var renderStatus = function () {
 				var info = initInfo(initState);
@@ -360,9 +410,96 @@ return view.extend({
 					vel.innerHTML = '';
 					kids.forEach(function (k) { vel.appendChild(k); });
 				}
+
+				var rel = document.getElementById(repoRowId);
+				if (rel && !repoEditing) {
+					rel.innerHTML = '';
+					var repoTxt = curRepo || '（未知）';
+					if (repoSwitching) {
+						rel.appendChild(E('span', { 'style': 'font-family:monospace;margin-right:12px' }, repoTxt));
+						rel.appendChild(E('span', { 'class': 'spinning' }, ' 切换中…'));
+					} else {
+						rel.appendChild(E('span', { 'style': 'font-family:monospace;margin-right:12px' }, repoTxt));
+						rel.appendChild(E('button', {
+							'class': 'cbi-button cbi-button-neutral',
+							'click': ui.createHandlerFn(self, function () {
+								repoEditing = true;
+								renderStatus();
+							})
+						}, '修改'));
+					}
+				}
 			};
 
-			initUpdaters.push(renderStatus);
+			// Rendering of the repo row's edit mode lives outside renderStatus
+			// (it needs its own DOM each time editing starts/stops, rather than
+			// being rebuilt on every poll tick which would fight the user's
+			// typing in the input box).
+			var renderRepoEdit = function () {
+				var rel = document.getElementById(repoRowId);
+				if (!rel) return;
+				rel.innerHTML = '';
+				var input = E('input', {
+					'type': 'text',
+					'style': 'width:420px;font-family:monospace',
+					'value': curRepo || '',
+					'placeholder': 'https://github.com/owner/repo 或 owner/repo'
+				});
+				var cancel = function () {
+					repoEditing = false;
+					renderStatus();
+				};
+				var confirmSwitch = function () {
+					var val = (input.value || '').trim();
+					if (!val) { ui.addNotification(null, E('p', {}, '仓库地址不能为空'), 'warning'); return; }
+					// Normalize client-side just for the "no change" comparison;
+					// manage.sh does its own normalization when actually used.
+					var norm = val.replace(/^https?:\/\//, '').replace(/^github\.com\//, '')
+						.replace(/\.git$/, '').split('/').slice(0, 2).join('/');
+					var curNorm = (curRepo || '').replace(/^https?:\/\//, '').replace(/^github\.com\//, '')
+						.replace(/\.git$/, '').split('/').slice(0, 2).join('/');
+					if (norm === curNorm) { repoEditing = false; renderStatus(); return; }
+					ui.showModal('切换核心来源', [
+						E('p', {}, '仓库地址已更改为：'),
+						E('p', { 'style': 'font-family:monospace;font-weight:600' }, norm),
+						E('p', { 'style': 'color:#c62828' },
+							'确认后将立即从新仓库重新下载并替换当前的 phantun_server / phantun_client，' +
+							'服务端与客户端需使用同一来源，否则可能因协议实现差异导致无法握手。是否继续？'),
+						E('div', { 'class': 'right' }, [
+							E('button', {
+								'class': 'cbi-button cbi-button-neutral',
+								'click': function () { ui.hideModal(); }
+							}, '取消'),
+							E('button', {
+								'class': 'cbi-button cbi-button-negative important',
+								'style': 'margin-left:8px',
+								'click': function () {
+									ui.hideModal();
+									repoEditing = false;
+									doSwitchRepo(norm);
+								}
+							}, '确认并重新初始化')
+						])
+					]);
+				};
+				rel.appendChild(input);
+				rel.appendChild(E('button', {
+					'class': 'cbi-button cbi-button-save',
+					'style': 'margin-left:8px',
+					'click': confirmSwitch
+				}, '确定'));
+				rel.appendChild(E('button', {
+					'class': 'cbi-button cbi-button-neutral',
+					'style': 'margin-left:4px',
+					'click': cancel
+				}, '取消'));
+				input.focus();
+			};
+
+			initUpdaters.push(function () {
+				if (repoEditing) renderRepoEdit();
+				else renderStatus();
+			});
 			ensurePoll();
 			requestAnimationFrame(renderStatus);
 
@@ -375,6 +512,10 @@ return view.extend({
 				E('div', { 'class': 'cbi-value' }, [
 					E('label', { 'class': 'cbi-value-title' }, '核心版本'),
 					E('div', { 'class': 'cbi-value-field', 'id': versionRowId }, E('em', {}, '…'))
+				]),
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, '核心来源'),
+					E('div', { 'class': 'cbi-value-field', 'id': repoRowId }, E('em', {}, '…'))
 				])
 			]);
 		}, s, this);
@@ -619,7 +760,11 @@ return view.extend({
 		o.modalonly = true;
 
 		o = s.option(form.Value, 'extra_args', '额外参数',
-			'可选。追加到 Phantun 命令行的额外参数（高级用途）。');
+			'可选。追加到 Phantun 命令行的额外参数（高级用途）。' +
+			'其中 --time 用于开启 TCP 指纹伪装：握手包补全 MSS / SACK_PERMITTED / Timestamps 等选项，' +
+			'并在后续数据包上携带滚动时间戳，使其更接近真实系统的 TCP 连接，避免因指纹过于精简（仅有 WScale）被部分网络环境的 DPI/防火墙识别并静默丢弃回包。' +
+			'默认不开启，行为与官方版本完全一致。' +
+			'必须服务端和客户端同时填写 --time 才会生效，只有一端填写会导致双方构造的数据包格式不一致，握手失败。');
 		o.modalonly = true;
 
 		return m.render();
