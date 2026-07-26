@@ -19,6 +19,8 @@
 #   manage.sh cur_version | check_update | log
 #   manage.sh rule_conn <name> | rule_resolved <name> | rule_log <name>
 
+. /lib/functions.sh
+
 BIN_DIR=/usr/bin
 SERVER_BIN="$BIN_DIR/phantun_server"
 CLIENT_BIN="$BIN_DIR/phantun_client"
