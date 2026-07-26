@@ -376,10 +376,19 @@ cmd_rule_conn() {
 	lines=$(grep "dport=${port} " /proc/net/nf_conntrack 2>/dev/null)
 	[ -n "$lines" ] || { echo "none"; return 0; }
 
-	if echo "$lines" | grep -q "ESTABLISHED"; then
-		echo "established"
-	elif echo "$lines" | grep -qE "SYN_SENT|SYN_RECV"; then
+	# Check SYN_SENT/SYN_RECV FIRST, not ESTABLISHED. Phantun's fake-tcp uses
+	# a fresh source port on every retry, so a stale ESTABLISHED entry from a
+	# connection that worked hours ago (conntrack's default TCP ESTABLISHED
+	# timeout is ~5 days) can sit in the table at the same time as brand-new
+	# SYN_SENT entries from the current, actively-failing retry loop. Simply
+	# grepping for "ESTABLISHED" anywhere in the table falsely reports success
+	# while the tunnel is actually stuck retrying right now. An active
+	# handshake attempt in progress is always the more current, trustworthy
+	# signal, so it takes priority over any ESTABLISHED line.
+	if echo "$lines" | grep -qE "SYN_SENT|SYN_RECV"; then
 		echo "handshaking"
+	elif echo "$lines" | grep -q "ESTABLISHED"; then
+		echo "established"
 	else
 		echo "none"
 	fi
