@@ -1,0 +1,74 @@
+name: Build APK and publish packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag
+        required: true
+        default: v1.3.5
+      publish:
+        description: Create/update GitHub Release and upload APK/IPK
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev \
+            file wget jq libelf-dev libyaml-dev
+
+      - name: Prepare OpenWrt APK build tree
+        run: |
+          git clone --depth 1 --branch openwrt-25.12 https://github.com/openwrt/openwrt.git openwrt
+          cp -a . openwrt/package/luci-app-phantun
+          cd openwrt
+          printf '%s\n' \
+            'CONFIG_TARGET_qualcommax=y' \
+            'CONFIG_TARGET_qualcommax_ipq60xx=y' \
+            'CONFIG_USE_APK=y' \
+            'CONFIG_SIGNED_PACKAGES=n' \
+            'CONFIG_SIGNATURE_CHECK=n' \
+            'CONFIG_PACKAGE_luci-app-phantun=m' > .config
+          ./scripts/feeds update luci
+          ./scripts/feeds install -a -p luci
+          make defconfig
+
+      - name: Build APK
+        run: |
+          cd openwrt
+          make package/luci-app-phantun/compile V=s -j2
+          find bin/packages -type f -name 'luci-app-phantun_*.apk' -print -exec cp {} "$GITHUB_WORKSPACE/" \;
+
+      - name: Collect IPK when available
+        run: |
+          find openwrt/bin -type f -name 'luci-app-phantun_*.ipk' -print -exec cp {} "$GITHUB_WORKSPACE/" \; || true
+          ls -lh luci-app-phantun_*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-phantun-packages-${{ inputs.release_tag }}
+          path: luci-app-phantun_*
+
+      - name: Publish Release assets
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ inputs.release_tag }}" >/dev/null 2>&1 || \
+            gh release create "${{ inputs.release_tag }}" --title "${{ inputs.release_tag }}" \
+              --notes "luci-app-phantun APK and IPK packages"
+          gh release upload "${{ inputs.release_tag }}" luci-app-phantun_* --clobber
