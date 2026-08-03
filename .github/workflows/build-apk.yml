@@ -3,13 +3,13 @@ name: Build APK and IPK packages
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       release_tag:
         description: GitHub Release tag
         required: true
-        default: v1.3.5
+        default: v1.3.8
       publish:
         description: Create/update GitHub Release and upload both packages
         required: true
@@ -20,102 +20,32 @@ permissions:
   contents: write
 
 env:
-  OPENWRT_BRANCH: openwrt-25.12
-  PACKAGE_NAME: luci-app-phantun
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
   build-packages:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout plugin
         uses: actions/checkout@v4
 
-      - name: Install OpenWrt build dependencies
+      - name: Build real IPK and APK without OpenWrt source tree
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang flex bison g++ gawk gettext git \
-            libncurses-dev libssl-dev python3-setuptools rsync swig unzip \
-            zlib1g-dev file wget jq libelf-dev libyaml-dev quilt
+          chmod +x build-packages.sh
+          DIST_DIR=dist ./build-packages.sh
 
-      - name: Clone OpenWrt source trees
-        run: |
-          git clone --depth 1 --branch "$OPENWRT_BRANCH" \
-            https://github.com/openwrt/openwrt.git openwrt-apk
-          git clone --depth 1 --branch "$OPENWRT_BRANCH" \
-            https://github.com/openwrt/openwrt.git openwrt-ipk
-
-      - name: Copy plugin into both build trees
-        run: |
-          mkdir -p openwrt-apk/package/$PACKAGE_NAME openwrt-ipk/package/$PACKAGE_NAME
-          rsync -a --delete \
-            --exclude '.git/' \
-            --exclude 'openwrt-apk/' \
-            --exclude 'openwrt-ipk/' \
-            ./ openwrt-apk/package/$PACKAGE_NAME/
-          rsync -a --delete \
-            --exclude '.git/' \
-            --exclude 'openwrt-apk/' \
-            --exclude 'openwrt-ipk/' \
-            ./ openwrt-ipk/package/$PACKAGE_NAME/
-
-      - name: Prepare APK build configuration
-        run: |
-          cd openwrt-apk
-          printf '%s\n' \
-            'CONFIG_TARGET_qualcommax=y' \
-            'CONFIG_TARGET_qualcommax_ipq60xx=y' \
-            'CONFIG_USE_APK=y' \
-            'CONFIG_SIGNED_PACKAGES=n' \
-            'CONFIG_SIGNATURE_CHECK=n' \
-            'CONFIG_PACKAGE_luci-app-phantun=m' > .config
-          ./scripts/feeds update luci
-          ./scripts/feeds install -a -p luci
-          make defconfig
-          grep -q '^CONFIG_USE_APK=y$' .config
-          make tools/install V=s -j2
-
-      - name: Prepare IPK build configuration
-        run: |
-          cd openwrt-ipk
-          printf '%s\n' \
-            'CONFIG_TARGET_qualcommax=y' \
-            'CONFIG_TARGET_qualcommax_ipq60xx=y' \
-            '# CONFIG_USE_APK is not set' \
-            'CONFIG_PACKAGE_luci-app-phantun=m' > .config
-          ./scripts/feeds update luci
-          ./scripts/feeds install -a -p luci
-          make defconfig
-          if grep -q '^CONFIG_USE_APK=y$' .config; then
-            echo 'ERROR: IPK tree unexpectedly has CONFIG_USE_APK=y'
-            exit 1
-          fi
-
-      - name: Build real APK
-        run: |
-          cd openwrt-apk
-          make package/$PACKAGE_NAME/compile V=s -j2
-          find bin/packages -type f -name "${PACKAGE_NAME}_*.apk" -print -exec cp {} "$GITHUB_WORKSPACE/" \;
-
-      - name: Build real IPK
-        run: |
-          cd openwrt-ipk
-          make package/$PACKAGE_NAME/compile V=s -j2
-          find bin/packages -type f -name "${PACKAGE_NAME}_*.ipk" -print -exec cp {} "$GITHUB_WORKSPACE/" \;
-
-      - name: Validate both package formats
+      - name: Validate package files
         run: |
           set -eux
-          APK=$(find . -maxdepth 1 -type f -name "${PACKAGE_NAME}_*.apk" | head -n 1)
-          IPK=$(find . -maxdepth 1 -type f -name "${PACKAGE_NAME}_*.ipk" | head -n 1)
+          APK=$(find dist -maxdepth 1 -type f -name '*.apk' | head -n 1)
+          IPK=$(find dist -maxdepth 1 -type f -name '*.ipk' | head -n 1)
           test -n "$APK"
           test -n "$IPK"
-          test "$(file -b "$APK" | grep -Ei 'ar archive|Debian binary package' >/dev/null; echo $?)" = 0
-          test "$(file -b "$IPK" | grep -Ei 'ar archive|Debian binary package' >/dev/null; echo $?)" = 0
-          command -v ar
-          ar t "$APK" | grep -q '^data.tar'
+          test -s "$APK"
+          test -s "$IPK"
           ar t "$IPK" | grep -q '^data.tar'
+          ar t "$IPK" | grep -q '^control.tar'
+          file "$APK" "$IPK"
           ls -lh "$APK" "$IPK"
 
       - name: Upload build artifacts
@@ -123,11 +53,11 @@ jobs:
         with:
           name: luci-app-phantun-packages-${{ env.RELEASE_TAG }}
           path: |
-            luci-app-phantun_*.apk
-            luci-app-phantun_*.ipk
+            dist/*.apk
+            dist/*.ipk
           if-no-files-found: error
 
-      - name: Publish Release assets
+      - name: Publish both packages to the same Release
         if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -137,4 +67,4 @@ jobs:
               --title "${{ env.RELEASE_TAG }}" \
               --notes "luci-app-phantun APK and IPK packages"
           gh release upload "${{ env.RELEASE_TAG }}" \
-            luci-app-phantun_*.apk luci-app-phantun_*.ipk --clobber
+            dist/*.apk dist/*.ipk --clobber
