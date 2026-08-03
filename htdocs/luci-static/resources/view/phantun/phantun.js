@@ -68,6 +68,7 @@ function uploadCore(role, title) {
 	if (uploading) return Promise.resolve();
 	var tmp = '/tmp/phantun_upload_' + role;
 	var errMap = {
+		'not_elf':       '文件不是 ELF 可执行文件（请勿直接上传 ZIP，需先解压）',
 		'empty_file':    '文件为空',
 		'bad_path':      '上传路径不合法',
 		'bad_role':      '角色参数错误',

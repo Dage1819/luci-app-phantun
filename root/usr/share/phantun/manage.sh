@@ -82,6 +82,11 @@ cmd_install_binary() {
 	[ "$src" = "$expected" ] || { echo "error:bad_path"; return 1; }
 	[ -f "$src" ] && [ -s "$src" ] || { rm -f "$src"; echo "error:empty_file"; return 1; }
 
+	# Reject non-ELF files (ZIP, text, error pages) early.
+	local magic
+	magic=$(hexdump -n 4 -e '1/1 "%02x"' "$src" 2>/dev/null)
+	[ "$magic" = "7f454c46" ] || { rm -f "$src"; echo "error:not_elf"; return 1; }
+
 	pgrep -x phantun_client >/dev/null 2>&1 && service_was_running=1
 	pgrep -x phantun_server >/dev/null 2>&1 && service_was_running=1
 	[ "$service_was_running" = "1" ] && /etc/init.d/phantun stop >/dev/null 2>&1
