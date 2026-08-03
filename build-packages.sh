@@ -130,8 +130,6 @@ EOF
           meson compile -C /tmp/apk-tools-build
           APK_BIN=/tmp/apk-tools-build/src/apk
           test -x "$APK_BIN"
-          "$APK_BIN" mkpkg --help >/dev/null
-          "$APK_BIN" mkndx --help >/dev/null
           "$APK_BIN" mkpkg \
             --info "name:$PKG_NAME" \
             --info "version:${PKG_VERSION}-r${PKG_RELEASE}" \
