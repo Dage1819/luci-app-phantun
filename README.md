@@ -1,6 +1,6 @@
 # luci-app-phantun
 
-LuCI 界面，用于管理 [Phantun](https://github.com/dndx/phantun) —— 一个把 UDP 流量伪装成真实 TCP 连接（FakeTCP）的高性能混淆工具，常用于穿透只允许 TCP、或对 UDP 限速/封锁的网络，配合 WireGuard 使用效果尤佳。
+LuCI 界面，用于管理 [Phantun](https://github.com/Dage1819/phantun) —— 一个把 UDP 流量伪装成真实 TCP 连接（FakeTCP）的高性能混淆工具，常用于穿透只允许 TCP、或对 UDP 限速/封锁的网络，配合 WireGuard 使用效果尤佳。
 
 ![界面预览](1.jpg)
 
