@@ -74,6 +74,7 @@ jobs:
           ./scripts/feeds install -a -p luci
           make defconfig
           grep -q '^CONFIG_USE_APK=y$' .config
+          make tools/install V=s -j2
 
       - name: Prepare IPK build configuration
         run: |
