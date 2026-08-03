@@ -103,9 +103,9 @@ EOF
         -v "$DATA_DIR:/pkg/files:ro" \
         -v "$apk_dir/post-install.sh:/pkg/post-install.sh:ro" \
         -v "$(pwd)/$DIST_DIR:/pkg/out" \
-        alpine:latest sh -c "
+        alpine:edge sh -c "
           set -e
-          apk add --no-cache apk-tools-mkpkg >/dev/null 2>&1 || true
+          apk add --no-cache apk-tools-mkpkg
           command -v apk
           apk mkpkg --help >/dev/null
           apk mkpkg \\
