@@ -34,8 +34,8 @@ jobs:
         id: version
         run: |
           set -e
-          VER=$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -n1)
-          REL=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -n1)
+          VER=$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -n1 | tr -d '\r[:space:]')
+          REL=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -n1 | tr -d '\r[:space:]')
           TAG="v${VER}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "$TAG" ]; then
             echo "Tag ${GITHUB_REF_NAME} does not match Makefile PKG_VERSION ${TAG}" >&2

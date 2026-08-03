@@ -2,8 +2,8 @@
 set -e
 
 PKG_NAME="luci-app-phantun"
-PKG_VERSION="$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -n1)"
-PKG_RELEASE="$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -n1)"
+PKG_VERSION="$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -n1 | tr -d '\r[:space:]')"
+PKG_RELEASE="$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -n1 | tr -d '\r[:space:]')"
 MAINTAINER="Dage"
 DESCRIPTION="LuCI support for Phantun (UDP over FakeTCP)"
 HOMEPAGE="https://github.com/Dage1819/luci-app-phantun"
