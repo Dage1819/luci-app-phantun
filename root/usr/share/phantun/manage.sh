@@ -84,7 +84,7 @@ cmd_install_binary() {
 
 	# Reject ZIP files, text, and downloaded error pages. Do not execute the
 	# untrusted upload for validation; startup will reveal any arch mismatch.
-	magic=$(od -An -tx1 -N4 "$src" 2>/dev/null | tr -d ' \n')
+	magic=$(hexdump -n 4 -e '4/1 "%02x"' "$src" 2>/dev/null)
 	[ "$magic" = "7f454c46" ] || { rm -f "$src"; echo "error:not_elf"; return 1; }
 
 	pgrep -x phantun_client >/dev/null 2>&1 && service_was_running=1
