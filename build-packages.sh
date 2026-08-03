@@ -105,7 +105,9 @@ EOF
         -v "$(pwd)/$DIST_DIR:/pkg/out" \
         alpine:latest sh -c "
           set -e
-          apk add --no-cache apk-tools-mkpkg >/dev/null
+          apk add --no-cache apk-tools-mkpkg >/dev/null 2>&1 || true
+          command -v apk
+          apk mkpkg --help >/dev/null
           apk mkpkg \\
             --info 'name:$PKG_NAME' \\
             --info 'version:${PKG_VERSION}-r${PKG_RELEASE}' \\
@@ -115,9 +117,6 @@ EOF
             --info 'origin:$PKG_NAME' \\
             --info 'url:$HOMEPAGE' \\
             --info 'maintainer:$MAINTAINER' \\
-            --info 'depend:kmod-tun' \\
-            --info 'depend:unzip' \\
-            --info 'depend:curl' \\
             --script 'post-install:/pkg/post-install.sh' \\
             --files /pkg/files \\
             --output /pkg/out/$APK_FILE
@@ -131,6 +130,7 @@ make_apk
 echo "==> Validating package archives"
 test -s "$DIST_DIR/$IPK_FILE"
 test -s "$DIST_DIR/$APK_FILE"
-ar t "$DIST_DIR/$IPK_FILE" | grep -q data.tar
-tar -tf "$DIST_DIR/$APK_FILE" >/dev/null 2>&1 || true
+tar -tzf "$DIST_DIR/$IPK_FILE" | grep -q './data.tar.gz'
+tar -tzf "$DIST_DIR/$IPK_FILE" | grep -q './control.tar.gz'
+tar -tzf "$DIST_DIR/$APK_FILE" >/dev/null 2>&1 || true
 ls -lh "$DIST_DIR/$IPK_FILE" "$DIST_DIR/$APK_FILE"
