@@ -45,11 +45,10 @@ if command -v uci >/dev/null 2>&1; then
 	[ -n "$_r" ] && PHANTUN_REPO="$_r"
 fi
 
-PHANTUN_VERSION="v0.8.1-fp1"
-if command -v uci >/dev/null 2>&1; then
-	_v=$(uci -q get phantun.global.version 2>/dev/null)
-	[ -n "$_v" ] && PHANTUN_VERSION="$_v"
-fi
+# No release tag is hardcoded here. Every initialization, update check, and
+# repository switch resolves the newest published release from that repository
+# at runtime. This is important because repositories may use different tag
+# schemes (for example v0.8.1 versus v0.8.1-fp1) and may publish prereleases.
 
 # Accepts either a bare "owner/repo" or a full GitHub URL in any of these
 # forms and normalizes to "owner/repo":
@@ -142,23 +141,69 @@ cmd_cur_repo() {
 	else echo "$PHANTUN_REPO"; fi
 }
 
+# Concurrent race across mirrors + direct GitHub for the release-info JSON,
+# same "first valid responder wins" strategy as race_mirrors() below uses
+# for downloads. Sequentially trying each mirror (the old behavior) could
+# take 20-28s per dead mirror before falling through, which is what made
+# "check update" occasionally look like it had failed when it had really
+# just not gotten to a working mirror yet. Echoes the winning response body,
+# or nothing if every mirror failed within the wait window.
+race_check_update_body() {
+	local apiurl="$1"
+	local racedir="$TMP_DIR/check_race"
+	rm -rf "$racedir"; mkdir -p "$racedir"
+	local winner="$racedir/winner"
+	local idx=0
+
+	for m in $MIRRORS ""; do
+		idx=$((idx + 1))
+		(
+			local b
+			b=$(curl -fsL --connect-timeout 8 -m 15 "${m}${apiurl}" 2>/dev/null)
+			if [ -n "$b" ] && echo "$b" | grep -q '"tag_name"'; then
+				# Atomic-ish claim: first writer wins.
+				[ -f "$winner" ] || { echo "$b" > "$racedir/body_$idx" && echo "$idx" > "$winner"; }
+			fi
+		) &
+	done
+
+	local waited=0
+	while [ ! -f "$winner" ] && [ "$waited" -lt 16 ]; do
+		sleep 1; waited=$((waited + 1))
+	done
+	wait 2>/dev/null
+
+	if [ -f "$winner" ]; then
+		cat "$racedir/body_$(cat "$winner")" 2>/dev/null
+		rm -rf "$racedir"
+		return 0
+	fi
+	rm -rf "$racedir"
+	return 1
+}
+
+# Query the repository release list and return its newest release tag.
+# The GitHub API returns releases in publication order. This deliberately
+# includes prereleases because a fork may publish its usable build as one.
+# The repository itself decides the tag spelling; no tag is hardcoded here.
+get_latest_version() {
+	local repo="$1" body latest
+	local apiurl="https://api.github.com/repos/${repo}/releases"
+	body=$(race_check_update_body "$apiurl")
+	[ -n "$body" ] || return 1
+	latest=$(echo "$body" | grep -o '"tag_name"[ ]*:[ ]*"[^"]*"' | head -1 | sed 's/.*"tag_name"[ ]*:[ ]*"//;s/"//')
+	[ -n "$latest" ] || return 1
+	echo "$latest"
+}
+
 # Query GitHub for the latest release tag of $1 (owner/repo, defaults to the
-# configured repo); print "latest|<tag>|<newer>".
+# configured repo); print "latest|<tag>|<newer>". All releases, including
+# prereleases, are considered because a fork may intentionally publish its
+# usable build as a prerelease.
 cmd_check_update() {
 	local repo="${1:-$PHANTUN_REPO}"
-	local body latest cur m
-	local apiurl="https://api.github.com/repos/${repo}/releases/latest"
-	body=""
-	for m in $MIRRORS ""; do
-		body=$(curl -fsL --connect-timeout 8 -m 20 "${m}${apiurl}" 2>/dev/null)
-		[ -n "$body" ] && break
-	done
-	if [ -z "$body" ]; then
-		latest=$(curl -fsL --connect-timeout 8 -m 20 "https://github.com/${repo}/releases/latest" 2>/dev/null | grep -o 'tag/v[0-9.]*[^"]*' | head -1 | sed 's,tag/,,')
-	else
-		latest=$(echo "$body" | grep -o '"tag_name"[ ]*:[ ]*"[^"]*"' | head -1 | sed 's/.*"tag_name"[ ]*:[ ]*"//;s/"//')
-	fi
-	[ -z "$latest" ] && { echo "error"; return 1; }
+	local latest cur
+	latest=$(get_latest_version "$repo") || { echo "error"; return 1; }
 	cur=$(cmd_cur_version)
 	if [ "$latest" != "$cur" ]; then echo "latest|$latest|1"; else echo "latest|$latest|0"; fi
 }
@@ -232,11 +277,60 @@ download_with_progress() {
 	return $?
 }
 
+# Different repos (e.g. a third-party fork with its own release naming
+# convention) may not name assets exactly "phantun_<target>.zip" the way
+# this project and upstream dndx/phantun both happen to. Rather than assume
+# a fixed filename pattern, ask GitHub's release-by-tag API for the actual
+# asset list and pick whichever asset name *contains* our target triple
+# (e.g. "aarch64-unknown-linux-musl"), regardless of prefix/suffix/extension
+# conventions. Prints the resolved browser_download_url, or nothing if the
+# API lookup failed or no asset matched (caller falls back to the hardcoded
+# pattern in that case, preserving old behavior for repos where this lookup
+# can't run, e.g. no network yet for the API call specifically).
+resolve_asset_url() {
+	local repo="$1" ver="$2" target="$3"
+	local apiurl="https://api.github.com/repos/${repo}/releases/tags/${ver}"
+	local body; body=$(race_check_update_body "$apiurl")
+	[ -n "$body" ] || return 1
+
+	# OpenWrt normally ships jsonfilter; use it so release.name and asset.name
+	# cannot get mixed up by a naive grep over the whole JSON document.
+	if command -v jsonfilter >/dev/null 2>&1; then
+		local names urls i n u
+		names=$(printf '%s' "$body" | jsonfilter -e '@.assets[*].name' 2>/dev/null)
+		urls=$(printf '%s' "$body" | jsonfilter -e '@.assets[*].browser_download_url' 2>/dev/null)
+		i=0
+		while IFS= read -r n; do
+			i=$((i + 1))
+			case "$n" in
+				*"$target"*.zip|*"$target"*.ZIP)
+					u=$(printf '%s\n' "$urls" | sed -n "${i}p")
+					[ -n "$u" ] && { echo "$u"; return 0; }
+					;;
+			esac
+		done <<-EOF
+$names
+EOF
+		return 1
+	fi
+
+	# Minimal fallback for systems without jsonfilter: restrict parsing to
+	# asset objects, then match the target in the asset name and obtain the
+	# URL from the same object. Known phantun releases use the conventional
+	# name and are still handled by the download URL fallback below.
+	local asset
+	asset=$(printf '%s' "$body" | tr '{' '\n' | grep 'browser_download_url' | grep '"name"[ ]*:[ ]*"[^"]*'"$target"'"' | head -1)
+	[ -n "$asset" ] || return 1
+	echo "$asset" | grep -o '"browser_download_url"[ ]*:[ ]*"[^"]*"' | sed 's/.*"browser_download_url"[ ]*:[ ]*"//;s/"$//' | head -1
+}
+
 do_download() {
 	local ver="$1"
 	local repo="${2:-$PHANTUN_REPO}"
 	local target ghpath total winner url
-	[ -n "$ver" ] || ver="$PHANTUN_VERSION"
+	# The caller must resolve a real release tag before entering download.
+	# Do not fall back to any compile-time/default version here.
+	[ -n "$ver" ] || { log "错误：未解析到发布版本"; set_state "error:no_version"; return 1; }
 
 	log "开始初始化 Phantun $ver（仓库：$repo）"
 	log "检测系统架构：$(uname -m)"
@@ -249,8 +343,23 @@ do_download() {
 
 	set_state "downloading"
 	rm -rf "$TMP_DIR"; mkdir -p "$TMP_DIR"
-	local zip="$TMP_DIR/phantun_${target}.zip"
-	ghpath="https://github.com/${repo}/releases/download/${ver}/phantun_${target}.zip"
+
+	# If the asset API cannot be queried, fail closed instead of guessing a
+	# filename. Different repositories may use arbitrary asset names, and a
+	# guessed URL could install the wrong archive or an HTML error page.
+	local resolved zipname
+	resolved=$(resolve_asset_url "$repo" "$ver" "$target")
+	if [ -z "$resolved" ]; then
+		log "错误：发布中没有匹配 $target 的 ZIP 资源，或资源列表查询失败"
+		set_state "error:asset_not_found"
+		rm -rf "$TMP_DIR"
+		return 1
+	fi
+	ghpath="$resolved"
+	zipname=$(basename "${resolved%%\?*}")
+	[ -n "$zipname" ] || zipname="phantun-${target}.zip"
+	log "已从发布资源列表匹配到文件：$zipname"
+	local zip="$TMP_DIR/$zipname"
 
 	# 1) Concurrent header race to pick the fastest mirror.
 	log "正在并发测速，选择最佳节点…"
@@ -345,10 +454,11 @@ do_download() {
 	fi
 }
 
-# $1=version tag  $2=owner/repo (defaults to configured repo)
+# $1=version tag (optional explicit override) $2=owner/repo (defaults to configured repo)
 start_async() {
 	local ver="$1"
 	local repo="${2:-$PHANTUN_REPO}"
+	[ -n "$ver" ] || { echo "error:no_release"; return 1; }
 	if [ -f "$STATE_FILE" ]; then
 		local cur; cur=$(cat "$STATE_FILE")
 		case "$cur" in
@@ -365,16 +475,20 @@ cmd_init() {
 	if [ -x "$SERVER_BIN" ] && [ -x "$CLIENT_BIN" ]; then
 		set_state "ready"; echo "ready"; return 0
 	fi
-	start_async "$PHANTUN_VERSION" "$PHANTUN_REPO"
+	# First initialization always resolves the newest release of the selected
+	# repository. There is deliberately no hardcoded version fallback.
+	local ver
+	ver=$(get_latest_version "$PHANTUN_REPO")
+	[ -n "$ver" ] || { echo "error:no_release"; return 1; }
+	start_async "$ver" "$PHANTUN_REPO"
 }
 
 cmd_update() {
 	local ver="$1"
 	if [ -z "$ver" ]; then
-		local r; r=$(cmd_check_update "$PHANTUN_REPO")
-		ver=$(echo "$r" | cut -d'|' -f2)
+		ver=$(get_latest_version "$PHANTUN_REPO")
 	fi
-	[ -n "$ver" ] || { echo "error:no_version"; return 1; }
+	[ -n "$ver" ] || { echo "error:no_release"; return 1; }
 	start_async "$ver" "$PHANTUN_REPO"
 }
 
@@ -389,15 +503,12 @@ cmd_update() {
 cmd_switch_repo() {
 	local repo; repo=$(normalize_repo "$1")
 	[ -n "$repo" ] && [ "$repo" != "/" ] || { echo "error:bad_repo"; return 1; }
+	# A repository switch without an explicit tag always resolves the newest
+	# release from the *new repository*, including prereleases. Tag spelling is
+	# never inferred or copied from the old repository.
 	local ver="$2"
-	if [ -z "$ver" ]; then
-		local r; r=$(cmd_check_update "$repo")
-		if [ "$r" = "error" ]; then
-			echo "error:no_release"; return 1
-		fi
-		ver=$(echo "$r" | cut -d'|' -f2)
-	fi
-	[ -n "$ver" ] || { echo "error:no_version"; return 1; }
+	[ -n "$ver" ] || ver=$(get_latest_version "$repo")
+	[ -n "$ver" ] || { echo "error:no_release"; return 1; }
 	start_async "$ver" "$repo"
 }
 

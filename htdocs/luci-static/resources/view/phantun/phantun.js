@@ -179,7 +179,7 @@ function showInitLogModal(title) {
 				el.textContent = text || '正在启动…';
 				el.scrollTop = el.scrollHeight;
 			}
-			if (st === 'ready') { finish(true); }
+		if (st === 'ready') { finish(true); }
 			else if (st.indexOf('error:') === 0) { finish(false); }
 		});
 	};
@@ -273,7 +273,10 @@ function initInfo(state) {
 			'extract_failed': '解压失败',
 			'binary_not_found': '压缩包内未找到程序文件',
 			'install_failed': '安装失败',
-			'no_unzip': '缺少 unzip 且自动安装失败'
+			'no_unzip': '缺少 unzip 且自动安装失败',
+			'no_version': '仓库没有可用的发布版本或版本查询失败',
+			'no_release': '未能获取仓库最新发布版本',
+			'asset_not_found': '最新发布中没有适配本机架构的核心压缩包'
 		};
 		var msg = map[reason] || reason;
 		if (reason.indexOf('unsupported_arch') === 0)
@@ -375,7 +378,12 @@ return view.extend({
 						kids.push(E('button', {
 							'class': 'cbi-button cbi-button-action important',
 							'click': ui.createHandlerFn(self, function () {
-								return fs.exec(MANAGE, [ 'init' ]).then(function () {
+								return fs.exec(MANAGE, [ 'init' ]).then(function (res) {
+									var out = ((res && res.stdout) ? res.stdout : '').trim();
+									if ((res && res.code !== 0) || out.indexOf('error:') === 0) {
+										ui.addNotification(null, E('p', {}, '初始化失败：%s'.format(out || (res && res.stderr) || '未知错误')), 'error');
+										return refreshAll();
+									}
 									initState = 'downloading'; notifyInit();
 									showInitLogModal('初始化 Phantun');
 									return refreshAll();
@@ -389,7 +397,12 @@ return view.extend({
 						kids.push(E('button', {
 							'class': 'cbi-button cbi-button-action important',
 							'click': ui.createHandlerFn(self, function () {
-								return fs.exec(MANAGE, [ 'update' ]).then(function () {
+								return fs.exec(MANAGE, [ 'update' ]).then(function (res) {
+									var out = ((res && res.stdout) ? res.stdout : '').trim();
+									if ((res && res.code !== 0) || out.indexOf('error:') === 0) {
+										ui.addNotification(null, E('p', {}, '更新失败：%s'.format(out || (res && res.stderr) || '未知错误')), 'error');
+										return refreshAll();
+									}
 									initState = 'downloading'; hasUpdate = false; notifyInit();
 									showInitLogModal('更新 Phantun');
 									return refreshAll();
