@@ -43,7 +43,7 @@ Maintainer: $MAINTAINER
 Section: luci
 Priority: optional
 Installed-Size: $INSTALLED_SIZE
-Depends: kmod-tun, unzip, curl, bind-host | drill
+Depends: kmod-tun, bind-host | drill
 Description: $DESCRIPTION
 Homepage: $HOMEPAGE
 License: $LICENSE
@@ -74,8 +74,6 @@ EOF
     (cd "$ipk_dir/control" && "$TAR" --format=gnu --numeric-owner --owner=0 --group=0 -cf - . | gzip -n > "$ipk_dir/control.tar.gz")
     (cd "$ipk_dir" && "$TAR" --format=gnu --numeric-owner --owner=0 --group=0 -cf - ./debian-binary ./data.tar.gz ./control.tar.gz | gzip -n > "$OLDPWD/$DIST_DIR/$IPK_FILE")
 }
-
-make_apk() {
     command -v docker >/dev/null 2>&1 || { echo "Docker is required to build APK" >&2; exit 1; }
     local apk_dir="$WORK_DIR/apk"
     mkdir -p "$apk_dir"
@@ -138,7 +136,7 @@ EOF
             --info "origin:$PKG_NAME" \
             --info "url:$HOMEPAGE" \
             --info "maintainer:$MAINTAINER" \
-            --info "depends:kmod-tun unzip curl" \
+            --info "depends:kmod-tun" \
             --script "post-install:/pkg/post-install.sh" \
             --script "post-deinstall:/pkg/post-deinstall.sh" \
             --files /pkg/files \

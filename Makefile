@@ -10,16 +10,18 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-phantun
-PKG_VERSION:=1.3.13
+PKG_VERSION:=1.4.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Dage
 
 LUCI_TITLE:=LuCI support for Phantun (UDP over FakeTCP)
-# curl: header-race mirror probing + downloads. unzip: extract release zip.
 # kmod-tun: Phantun creates TUN interfaces.
-LUCI_DEPENDS:=+kmod-tun +unzip +curl
+# The Phantun binaries are NOT downloaded automatically; the user uploads
+# them manually via the LuCI interface after downloading from the Releases
+# page. No curl or unzip is required at runtime.
+LUCI_DEPENDS:=+kmod-tun
 LUCI_PKGARCH:=all
 
 # bind-host | drill: either DNS lookup tool satisfies the DDNS monitor's

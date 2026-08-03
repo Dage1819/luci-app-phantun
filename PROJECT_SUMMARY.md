@@ -3,81 +3,92 @@
 > 把这份文件贴给新对话，或让助手读取它，即可无缝接上开发进度。
 
 ## 项目定位
-LuCI 界面插件，管理 [Phantun](https://github.com/dndx/phantun)（UDP over FakeTCP 混淆工具）。
+LuCI 界面插件，管理 [Phantun](https://github.com/Dage1819/phantun)（UDP over FakeTCP 混淆工具）。
 把 UDP 伪装成真实 TCP，穿透只允许 TCP / 对 UDP 限速封锁的网络，常配合 WireGuard 用。
 参考同作者的姊妹项目 `luci-app-udp2raw-ultra`（在 `../luci-app-udp2raw-ultra`）对齐能力。
 
 ## 关键设计决策（重要，别推翻）
-1. **不内置二进制**：首次点「初始化」，按架构从 GitHub 下载官方 release（.zip），插件轻量、适配任意内核。
-2. **下载策略**：curl 并发 HEAD 竞速选最快镜像 → 停滞超时下载（`--speed-time 30 --speed-limit 2048`，无总超时，慢速不误杀）→ 失败自动轮询下一节点 → 直连 GitHub 作最后备援。gh-proxy.cn 已确认坏（压缩斜杠 404），已移除；gh.ddlc.top 可用。
-3. **解压**：官方是 .zip，依赖 `unzip`（Makefile 声明 + 运行时兜底自动装）。
-4. **地址族(family)**：只有**客户端**有（解析对端域名走 A/AAAA）；**服务端不选地址族**。
-5. **自动防火墙**：只有**服务端**需要。勾选 `auto_fw` → 用 UCI 写 fw4 的端口转发（reload/重启不丢，网页端「端口转发」可见）。
+1. **不内置二进制，手动上传安装**（v1.4.0 起）：插件不调用 GitHub API、不下载、不解压、不测速。
+   用户在「核心程序」页面看到本机目标 triple 和对应 ZIP 文件名，点链接跳转 Releases，在电脑上下载解压后，分别把 `phantun_client` / `phantun_server` ELF 文件上传到路由器。本地文件名不限，安装后自动命名为标准名称。后端验证 ELF magic（4 字节 `7f454c46`）拒绝 ZIP/文本/错误页。
+   **废弃**：旧的 curl 竞速下载、镜像列表、GitHub API 查询、unzip 解压依赖——全部移除，不可恢复。
+2. **地址族(family)**：只有**客户端**有（解析对端域名走 A/AAAA）；**服务端不选地址族**。
+3. **自动防火墙**：只有**服务端**需要。勾选 `auto_fw` → 用 UCI 写 fw4 的端口转发（reload/重启不丢，网页端「端口转发」可见）。
    - v4/v6 **必须两条**（DNAT 目标不同：v4→`192.168.201.2`，v6→`fcc9::2`），服务端固定生成两条，用户不用选。
    - 去勾/停止/卸载自动清除（`phantun_` 前缀标识）。
-   - **客户端不需要任何防火墙规则**（本机 WG→本机 phantun→出 wan，走 output/input 不走 forward，wan 默认 masq 兜底）。
-6. **DNS 解析绕过代理**（bypass.sh，独立路由表 994）：防止隧道断开后 DNS 走隧道导致的重连死锁。有「外网接口」下拉配合。
-7. **DDNS 域名监控**（monitor.sh）：客户端 remote 为域名 + 勾 monitor 时，定期重解析，IP 变化重启。
+   - **客户端不需要任何防火墙规则**。
+4. **DNS 解析绕过代理**（bypass.sh）：防止隧道断开后 DNS 走隧道导致的重连死锁。有「外网接口」下拉配合。
+5. **DDNS 域名监控**（monitor.sh）：客户端 remote 为域名 + 勾 monitor 时，定期重解析，IP 变化重启。
 
 ## 已修复的关键坑
-- **auto_fw/Flag 不写入配置**：LuCI 的 Flag 等于默认值时不落配置 → 必须 `o.rmempty=false` 强制写入。（这是"自动防火墙勾了没生成规则"的真因）
+- **auto_fw/Flag 不写入配置**：LuCI 的 Flag 等于默认值时不落配置 → 必须 `o.rmempty=false` 强制写入。
 - **外网接口不能下拉**：load() 要加 `network.getNetworks()`，wan_iface 用 ListValue + networks 填充。
-- **prerm/postrm/postinst 必须写在 `include luci.mk` 之前**（luci.mk 在 include 时就 BuildPackage）。prerm 会被系统自动生成覆盖，故清理放 postrm；postinst 用于 enable 服务（开机自启）。
+- **prerm/postrm/postinst 必须写在 `include luci.mk` 之前**。prerm 会被系统覆盖，清理放 postrm；postinst 用于 enable 服务。
 - **EXTRA_DEPENDS 写 OR 依赖**（`bind-host | drill`），不能用 LUCI_DEPENDS 的 select（select 不支持 OR）。
 
 ## 文件结构
-- `Makefile` — 依赖 kmod-tun/unzip/curl + bind-host|drill；postinst(enable)/postrm(清理)
-- `root/etc/init.d/phantun` — 服务：family解析、DNS bypass、nft apply、monitor、单规则控制(rule_start/stop/restart)
+- `Makefile` — 依赖 kmod-tun + bind-host|drill；postinst(enable)/postrm(清理)；无 curl/unzip
+- `build-packages.sh` — 本地构建 IPK/APK；CI 走 .github/workflows/build-apk.yml
+- `root/etc/init.d/phantun` — 服务：family 解析、DNS bypass、nft apply、monitor、单规则控制
 - `root/etc/config/phantun` — 默认配置
-- `root/usr/share/phantun/manage.sh` — 初始化下载/竞速/进度/版本/检测更新/日志
+- `root/usr/share/phantun/manage.sh` — 架构检测、双核心状态、ELF 上传安装、规则诊断
 - `root/usr/share/phantun/nftrules.sh` — 服务端自动防火墙（UCI 写 fw4，v4+v6 两条）
 - `root/usr/share/phantun/monitor.sh` — DDNS 监控
-- `root/usr/share/phantun/bypass.sh` — DNS 绕过代理（路由表 994）
-- `root/usr/share/rpcd/acl.d/luci-app-phantun.json` — ACL（manage.sh/init.d 通配 exec）
+- `root/usr/share/phantun/bypass.sh` — DNS 绕过代理
+- `root/usr/share/rpcd/acl.d/luci-app-phantun.json` — ACL（manage.sh/init.d exec + 两个固定上传路径读写）
 - `root/usr/share/luci/menu.d/luci-app-phantun.json` — 菜单（服务→Phantun）
-- `htdocs/luci-static/resources/view/phantun/phantun.js` — 前端（状态卡/初始化弹窗/规则表/poll实时刷新）
+- `htdocs/luci-static/resources/view/phantun/phantun.js` — 前端（手动上传状态卡/规则表/poll 实时刷新）
 
 ## 当前版本
-v1.3.0（PKG_VERSION 在 Makefile）
+v1.4.0（PKG_VERSION 在 Makefile）
 
 ### v1.2.0 变更
-- 新增「服务端例外路由」（客户端选项，默认关）：WireGuard 全局代理场景下，为 Phantun 服务端 IP 添加走物理 WAN 的例外路由，破解「隧道要靠自己才能建立」的死锁。
-- 例外路由跟随解析：按 family 分别加 v4(/32)/v6(/128)；开启后自动纳入域名监控，服务端域名 IP 变化时自动更新路由。
-- 生命周期闭环：规则停止 / 取消勾选 / 卸载插件均自动清除对应例外路由（状态文件 `/var/run/phantun/<cfg>.route` 精确记录）。
+- 新增「服务端例外路由」（客户端选项）：WireGuard 全局代理场景下，为 Phantun 服务端 IP 添加走物理 WAN 的例外路由，破解死锁。
+- 例外路由跟随解析；生命周期闭环（停止/取消勾选/卸载自动清除）。
 - 修复 init.d 脚本 CRLF 换行导致在 OpenWrt 上无法运行的问题。
 
 ### v1.2.1 变更
-- 修复致命 bug：`route.sh` 结尾的 CLI 分支（给 postrm 直接调用用）在被 `source` 进 init.d/monitor.sh 时，会拿 rc.common 的动作词（start/stop/rule_stop 等）去匹配、落入 `*)` 分支 `exit 1`，把整个 init.d 进程杀掉——导致启动/停止/重启按钮全部报错。已加 `$0` 判断，只有直接执行才走 CLI 分支。
+- 修复 `route.sh` CLI 分支被 source 时意外触发 `exit 1` 杀死 init.d 进程的致命 bug。
 
 ### v1.2.2 变更
-- **例外路由改为写 OpenWrt 标准静态路由**（`/etc/config/network` 的 `config route` / `config route6`），不再用独立路由表995 + ip rule。原因：用户环境的隧道默认路由本身就在 main 表，/32 或 /128 明细路由凭最长前缀匹配即可稳定压过 /0 默认路由，且写成标准静态路由后能直接在 LuCI「网络 → 静态路由」页面（IPv4/IPv6 分 tab，与 OpenWrt 原生一致）看到、手动核对、编辑，可管理性大幅提升。UCI 段命名 `phantun_<规则名>_v4`/`_v6`，`comment` 字段标注来源规则，卸载/停止/取消勾选/IP变化时精确删除对应段。
-- 网关解析加内核路由表兜底：`network_get_gateway(6)` 在「网关是 link-local 地址」或「多条 source-specific 默认路由」的环境下可能取不到值，此时回退去解析 `ip [-6] route list default dev <wan>` 的实际 `via`，避免网关为空导致 on-link 路由（会在邻居解析阶段丢包，是 IPv6 握手失败的真实根因之一）。
+- **例外路由改为写 OpenWrt 标准静态路由**（`/etc/config/network`），可在 LuCI「静态路由」页面看到、核对、编辑。
+- 网关解析加内核路由表兜底，修复 source-specific 默认路由环境下 IPv6 握手失败。
 
 ### v1.3.0 变更（诊断可见性）
-- **握手状态**：规则列表「状态」列，运行中的规则下方新增一行，基于 `/proc/net/nf_conntrack` 实时判断：`握手成功`(ESTABLISHED) / `握手中…`(SYN_SENT/SYN_RECV) / `未连接`。不依赖日志时间点，反映当前这一刻的真实连接状态。
-- **查看日志**（点击握手状态旁的链接）：弹窗展示该规则的过滤后日志（最近 100 条），只保留 ERROR/超时/连接关闭/无法解析/启动信息等有意义的事件，把每次重试都会刷的噪音（`Sent SYN to server`、`New UDP client from ...`）过滤掉。**不改 phantun 自身日志级别**（仍用 info，保证异常都被记录），过滤只在展示层做。已知限制：phantun 进程日志按二进制名（phantun_client/phantun_server）打 syslog tag，不按规则名区分，同一 mode 跑多条规则时日志无法在插件层面分开——这是 phantun 自身日志设计的限制。
-- **域名解析 IP 显示**：客户端规则若 remote 为域名，目标列下方显示当前实际解析并传给 phantun 的 IP（`→ 解析为 x.x.x.x`），来自 init.d 写入的状态文件 `/var/run/phantun/<cfg>.resolved`，重新解析（含域名监控触发的）会同步更新。
-- 后端新增 `manage.sh` 子命令：`rule_conn <name>`、`rule_resolved <name>`、`rule_log <name>`，均按规则名反查 uci 段，无需改动 ACL（已有 `manage.sh *` 通配授权）。
+- **握手状态**：基于 conntrack 实时显示握手成功/握手中/未连接。优先报告活跃 SYN，避免被 5 天 ESTABLISHED 旧条目误导。
+- **查看日志**：弹窗过滤后日志（保留错误/超时/关闭，过滤每次重试噪音）。
+- **域名解析 IP 显示**：规则列表直接显示当前传给 phantun 的解析 IP。
+- 后端新增 `rule_conn`、`rule_resolved`、`rule_log` 子命令。
+
+### v1.3.13 变更（构建/发布）
+- 修复 GitHub Actions APK 构建流程：固定 apk-tools 提交、移除非法字段、正确验证 adbdump。
+- 同时发布 IPK + APK 到同一 Release。
+- CI strip CRLF 修复包版本号。
+
+### v1.4.x 变更（手动上传核心，未发布）
+- **彻底移除自动下载**：删除 curl/unzip 依赖，删除 mirrors/竞速/API/进度/版本跟踪/仓库切换所有代码。
+- 新增 `manage.sh upload_info` 输出目标 triple、ZIP 名、Releases URL。
+- 新增 `manage.sh install_binary <client|server> <固定临时路径>` 验证 ELF 并原子安装。
+- 上传前后停止/重启受影响服务。
+- LuCI 状态卡完全重写：显示核心状态（已就绪/缺少 client/缺少 server/未安装）、目标架构、预期 ZIP 名、Releases 链接、两个独立上传按钮（上传中禁用防并发）。
+- ACL 增加两个固定临时路径的 read/write 权限。
+- Makefile/build-packages.sh 依赖去掉 curl/unzip。
+- init_status 返回值简化为 ready / missing:client / missing:server / missing。
 
 ## 已知问题 / 待查（IPv6 场景，跨会话记录）
-排查过一次「客户端 phantun v6 握手失败」的故障，结论：
-- 客户端 SYN confirmed 送达服务器（服务端 conntrack 看到正确的公网源地址），服务器正确回复 SYN+ACK（服务端日志/conntrack 均证实），但客户端从未收到该 SYN+ACK（客户端 conntrack 显示 `[UNREPLIED]`）。
-- 依次排除：例外路由网关漂移（网关核对一致）、WAN 地址 deprecated（preferred_lft 健康）、上级路由器 SLAAC 缺 DHCPv6-PD（切 Stateful DHCPv6 后 `Failed to assign subprefix` 报错依旧）、重启设备（无效）。
-- 最终结论：问题在客户端-服务器之间的公网路径（运营商骨干网或中间设备丢弃了回程包），双方本地配置均已验证正常，非插件/UCI 配置可解决。v4 全程稳定。
-- 无 tcpdump 环境下的排查手段：`/proc/net/nf_conntrack` grep 目标端口/地址（比 `logread` 更能反映实时状态，能看到 `[UNREPLIED]`、`ESTABLISHED`、`SYN_SENT` 等）；两端交叉对比是关键，单端日志容易得出片面结论。
-- 本次新增的握手状态/日志弹窗功能正是为了让这类排查在网页端更快看到「卡在哪一步」，但**跨设备网络路径问题仍需人工登录两端交叉核对，UI 无法自动化诊断这一层**。
+排查过一次「客户端 phantun v6 握手失败」的故障。最终结论：服务端运营商骨干网 source-specific 路由导致回程 SYN+ACK 走了不匹配的出口，返回 ICMP6 destination unreachable。修复方法：在服务端添加不受源地址限制的 IPv6 默认路由：
+```sh
+ip -6 route add default via fe80::xxxx dev pppoe-wan metric 1024
+```
+插件层面无法检测此类路径问题；`/proc/net/nf_conntrack` 的 `[UNREPLIED]` 标记是最直接的判断依据。
 
 ## 构建 & 发布
-- 构建：`wsl bash /mnt/c/Users/root/Pictures/wrt/build_phantun.sh`，产物 → `../build/luci-app-phantun_*.ipk`
-- SDK：`/home/user/awg-build/kwrt-sdk-qualcommax-ipq60xx_*`（aarch64_cortex-a53）
+- 构建：GitHub Actions `build-apk.yml`，自动产出 IPK + APK 并附到 Release。
 - 仓库：`github.com/Dage1819/luci-app-phantun`
-- 发布脚本：`../pub_phantun.sh`
+- **当前状态：改动未提交，不要推送或打标签，需先在真机验证手动上传流程。**
 
-## 真机验证状态（v1.1.1）
-- ✅ 服务端自动防火墙：勾选后生成 v4+v6 两条端口转发，网页端可见；去勾/停止自动清除。
+## 真机验证状态
+- ✅ 服务端自动防火墙：勾选后生成 v4+v6 两条端口转发；去勾/停止自动清除。
 - ✅ 客户端隧道零防火墙可通。
-- ✅ 初始化下载（多节点竞速 + 进度）真机正常。
-- ✅ 外网接口下拉、版本检测更新、卸载清理均正常。
-
-## 安全提醒
-多个脚本含明文 GitHub token（`ghp_...`），**发布后务必去 GitHub 吊销重建**。
+- ✅ 外网接口下拉、握手状态、规则日志弹窗。
+- ✅ v1.3.13 APK 已在真机 `apk add --allow-untrusted` 安装成功。
+- ⬜ 手动上传 phantun_client/phantun_server（v1.4.x 新功能，待真机验证）。

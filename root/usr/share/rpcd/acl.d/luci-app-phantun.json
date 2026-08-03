@@ -7,7 +7,9 @@
 				"service": [ "list" ]
 			},
 			"file": {
-				"/usr/share/phantun/manage.sh *": [ "exec" ]
+				"/usr/share/phantun/manage.sh *": [ "exec" ],
+				"/tmp/phantun_upload_client": [ "read", "write" ],
+				"/tmp/phantun_upload_server": [ "read", "write" ]
 			}
 		},
 		"write": {
@@ -17,7 +19,9 @@
 			},
 			"file": {
 				"/etc/init.d/phantun *": [ "exec" ],
-				"/usr/share/phantun/manage.sh *": [ "exec" ]
+				"/usr/share/phantun/manage.sh *": [ "exec" ],
+				"/tmp/phantun_upload_client": [ "read", "write" ],
+				"/tmp/phantun_upload_server": [ "read", "write" ]
 			}
 		}
 	}

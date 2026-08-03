@@ -1,8 +1,6 @@
 # phantun configuration
 # Global options
 config global 'global'
-	# Release tag is resolved dynamically from the selected GitHub repository.
-	# Do not pin a version here: repositories may use different tag formats.
 	# DNS server used when resolving client peer domains (optional; falls back
 	# to the system resolver if empty or unreachable).
 	option dns_server ''
