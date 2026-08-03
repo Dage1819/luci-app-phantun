@@ -111,7 +111,6 @@ EOF
         -e HOMEPAGE="$HOMEPAGE" \
         -e LICENSE="$LICENSE" \
         -e MAINTAINER="$MAINTAINER" \
-        -e INSTALLED_BYTES="$((INSTALLED_SIZE * 1024))" \
         -e APK_FILE="$APK_FILE" \
         -v "$DATA_DIR:/pkg/files:ro" \
         -v "$apk_dir/post-install.sh:/pkg/post-install.sh:ro" \
@@ -139,7 +138,6 @@ EOF
             --info "origin:$PKG_NAME" \
             --info "url:$HOMEPAGE" \
             --info "maintainer:$MAINTAINER" \
-            --info "installed-size:$INSTALLED_BYTES" \
             --info "depends:kmod-tun unzip curl" \
             --script "post-install:/pkg/post-install.sh" \
             --script "post-deinstall:/pkg/post-deinstall.sh" \
