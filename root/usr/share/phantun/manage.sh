@@ -1,12 +1,26 @@
 #!/bin/sh
-# Phantun management helper for manual core uploads and per-rule diagnostics.
-# The router never calls GitHub APIs, downloads release archives, or extracts
-# ZIP files. LuCI uploads the two ELF binaries to fixed temporary paths and
-# this helper installs them under their canonical names.
+# Phantun management helper: architecture detection, binary status,
+# initialization (download + extract), version tracking, update checking,
+# and a rolling init log the web UI streams in real time.
+#
+# Also provides per-rule diagnostics for the web UI: live handshake status
+# (from conntrack), the currently-resolved peer IP for domain-based client
+# rules, and a filtered error/event log.
+#
+# Download strategy:
+#   1. Try ghproxy.net mirror first (fastest for CN).
+#   2. Fall back to direct GitHub on failure.
+#   Version is resolved by scraping the /releases/latest HTML page
+#   (no GitHub API needed -- api.github.com is blocked by most mirrors).
+#
+# Manual install (SSH):
+#   Copy binaries directly to /usr/bin/phantun_client and
+#   /usr/bin/phantun_server, chmod +x, then restart the service.
+#   Version will show as "unknown" since no .version file is written.
 #
 # Usage:
-#   manage.sh status | init_status | upload_info
-#   manage.sh install_binary <client|server> </tmp/fixed-upload-path>
+#   manage.sh status | init_status | cur_version | cur_repo | log
+#   manage.sh init | check_update
 #   manage.sh rule_conn <name> | rule_resolved <name> | rule_log <name>
 
 . /lib/functions.sh
@@ -14,16 +28,35 @@
 BIN_DIR=/usr/bin
 SERVER_BIN="$BIN_DIR/phantun_server"
 CLIENT_BIN="$BIN_DIR/phantun_client"
+STATE_FILE=/tmp/phantun_init.status
+LOG_FILE=/tmp/phantun_init.log
+LOG_MAX=100
+TMP_DIR=/tmp/phantun_dl
+VERSION_FILE=/usr/share/phantun/.version
 RUN_STATE_DIR=/var/run/phantun
+
 DEFAULT_REPO="Dage1819/phantun"
 PHANTUN_REPO="$DEFAULT_REPO"
-
 if command -v uci >/dev/null 2>&1; then
 	_r=$(uci -q get phantun.global.repo 2>/dev/null)
 	case "$_r" in
 		[!/]*/*) PHANTUN_REPO="$(echo "$_r" | cut -d/ -f1-2)" ;;
 	esac
 fi
+
+# Two download nodes: ghproxy.net mirror (no API proxy, but proxies download
+# URLs), and direct GitHub as fallback.
+MIRROR_PROXY="https://ghproxy.net/"
+MIRROR_DIRECT=""   # empty = direct github.com
+
+log() {
+	local ts; ts=$(date '+%H:%M:%S')
+	echo "[$ts] $1" >> "$LOG_FILE"
+	local n; n=$(wc -l < "$LOG_FILE" 2>/dev/null)
+	[ "${n:-0}" -gt "$LOG_MAX" ] && tail -n "$LOG_MAX" "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+}
+log_reset() { : > "$LOG_FILE"; }
+set_state() { echo "$1" > "$STATE_FILE"; }
 
 detect_target() {
 	local m; m=$(uname -m)
@@ -40,71 +73,156 @@ detect_target() {
 	esac
 }
 
+# Scrape the latest release tag from the releases/latest HTML page.
+# No GitHub API needed -- uses ghproxy.net first, then direct.
+# Outputs the tag (e.g. v0.8.1-fp1) or empty on failure.
+get_latest_tag() {
+	local repo="$1" tag url html
+	# Try proxy first, then direct
+	for prefix in "$MIRROR_PROXY" "$MIRROR_DIRECT"; do
+		url="${prefix}https://github.com/${repo}/releases/latest"
+		html=$(curl -fsSL --connect-timeout 10 -m 20 "$url" 2>/dev/null)
+		tag=$(echo "$html" | grep -o 'tag/[^"]*' | head -1 | sed 's|tag/||')
+		[ -n "$tag" ] && echo "$tag" && return 0
+	done
+	return 1
+}
+
 cmd_status() {
 	if [ -x "$SERVER_BIN" ] && [ -x "$CLIENT_BIN" ]; then echo "ready"; else echo "missing"; fi
 }
 
 cmd_init_status() {
-	if [ -x "$SERVER_BIN" ] && [ -x "$CLIENT_BIN" ]; then
-		echo "ready"
-	elif [ -x "$SERVER_BIN" ]; then
-		echo "missing:client"
-	elif [ -x "$CLIENT_BIN" ]; then
-		echo "missing:server"
-	else
-		echo "missing"
+	if [ -f "$STATE_FILE" ]; then
+		local cur; cur=$(cat "$STATE_FILE")
+		case "$cur" in
+			downloading|extracting) echo "$cur"; return 0 ;;
+		esac
 	fi
+	if [ -x "$SERVER_BIN" ] && [ -x "$CLIENT_BIN" ]; then echo "ready"
+	else echo "missing"; fi
 }
 
-cmd_upload_info() {
-	local target
-	target=$(detect_target)
-	[ -n "$target" ] || { echo "error:unsupported_arch:$(uname -m)"; return 1; }
-	echo "${target}|phantun_${target}.zip|https://github.com/${PHANTUN_REPO}/releases"
+cmd_log() { [ -f "$LOG_FILE" ] && cat "$LOG_FILE" || echo ""; }
+
+cmd_cur_version() {
+	if [ -f "$VERSION_FILE" ]; then cat "$VERSION_FILE"
+	elif [ -x "$CLIENT_BIN" ]; then echo "unknown"
+	else echo "none"; fi
 }
 
-# Install one binary uploaded by LuCI. The browser-side filename is irrelevant;
-# role and a fixed upload path select the canonical destination.
-cmd_install_binary() {
-	local role="$1" src="$2" expected dst magic service_was_running=0
-	case "$role" in
-		client)
-			expected="/tmp/phantun_upload_client"
-			dst="$CLIENT_BIN"
-			;;
-		server)
-			expected="/tmp/phantun_upload_server"
-			dst="$SERVER_BIN"
-			;;
-		*) echo "error:bad_role"; return 1 ;;
-	esac
+cmd_cur_repo() { echo "$PHANTUN_REPO"; }
 
-	[ "$src" = "$expected" ] || { echo "error:bad_path"; return 1; }
-	[ -f "$src" ] && [ -s "$src" ] || { rm -f "$src"; echo "error:empty_file"; return 1; }
+# Download a URL to a file, trying proxy first then direct.
+# $1=ghpath (e.g. https://github.com/owner/repo/releases/download/...)
+# $2=output file
+download_file() {
+	local ghurl="$1" out="$2" url
+	for prefix in "$MIRROR_PROXY" "$MIRROR_DIRECT"; do
+		url="${prefix}${ghurl}"
+		log "尝试下载：$url"
+		if curl -fL --connect-timeout 12 --speed-time 30 --speed-limit 2048 \
+			-o "$out" "$url" >/dev/null 2>&1 && [ -s "$out" ]; then
+			return 0
+		fi
+		log "下载失败，尝试下一节点"
+	done
+	return 1
+}
 
-	# Reject non-ELF files (ZIP, text, error pages) early.
-	local magic
-	magic=$(hexdump -n 4 -e '1/1 "%02x"' "$src" 2>/dev/null)
-	[ "$magic" = "7f454c46" ] || { rm -f "$src"; echo "error:not_elf"; return 1; }
+do_download() {
+	local repo="$1"
+	log_reset
+	set_state "downloading"
 
-	pgrep -x phantun_client >/dev/null 2>&1 && service_was_running=1
-	pgrep -x phantun_server >/dev/null 2>&1 && service_was_running=1
-	[ "$service_was_running" = "1" ] && /etc/init.d/phantun stop >/dev/null 2>&1
+	log "检测系统架构：$(uname -m)"
+	local target; target=$(detect_target)
+	[ -n "$target" ] || { log "错误：不支持的架构 $(uname -m)"; set_state "error:unsupported_arch"; return 1; }
+	log "目标平台：$target"
 
-	if ! cp "$src" "${dst}.new" 2>/dev/null || ! chmod 0755 "${dst}.new" 2>/dev/null || ! mv -f "${dst}.new" "$dst" 2>/dev/null; then
-		rm -f "$src" "${dst}.new"
-		[ "$service_was_running" = "1" ] && /etc/init.d/phantun start >/dev/null 2>&1
-		echo "error:install_failed"
+	log "查询最新版本…"
+	local ver; ver=$(get_latest_tag "$repo")
+	[ -n "$ver" ] || { log "错误：无法获取最新版本（请检查网络）"; set_state "error:no_version"; return 1; }
+	log "最新版本：$ver"
+
+	rm -rf "$TMP_DIR"; mkdir -p "$TMP_DIR"
+	local zip="$TMP_DIR/phantun.zip"
+	local ghurl="https://github.com/${repo}/releases/download/${ver}/phantun_${target}.zip"
+
+	set_state "downloading"
+	download_file "$ghurl" "$zip" || {
+		log "错误：所有节点下载失败"
+		set_state "error:download_failed"
+		rm -rf "$TMP_DIR"
+		return 1
+	}
+	log "下载完成（$(wc -c < "$zip") 字节）"
+
+	set_state "extracting"
+	log "正在解压…"
+	if ! unzip -o "$zip" -d "$TMP_DIR" >/dev/null 2>&1; then
+		log "错误：解压失败"
+		set_state "error:extract_failed"
+		rm -rf "$TMP_DIR"
 		return 1
 	fi
-	rm -f "$src"
-	[ "$service_was_running" = "1" ] && /etc/init.d/phantun start >/dev/null 2>&1
 
-	if [ -x "$SERVER_BIN" ] && [ -x "$CLIENT_BIN" ]; then echo "ready"; else echo "installed:$role"; fi
+	local client_bin server_bin
+	client_bin=$(find "$TMP_DIR" -name "phantun_client" -type f | head -1)
+	server_bin=$(find "$TMP_DIR" -name "phantun_server" -type f | head -1)
+	[ -n "$client_bin" ] && [ -n "$server_bin" ] || {
+		log "错误：压缩包内未找到 phantun_client / phantun_server"
+		set_state "error:binary_not_found"
+		rm -rf "$TMP_DIR"
+		return 1
+	}
+
+	cp "$client_bin" "$CLIENT_BIN" && chmod 0755 "$CLIENT_BIN" || {
+		log "错误：安装 phantun_client 失败"
+		set_state "error:install_failed"
+		rm -rf "$TMP_DIR"
+		return 1
+	}
+	cp "$server_bin" "$SERVER_BIN" && chmod 0755 "$SERVER_BIN" || {
+		log "错误：安装 phantun_server 失败"
+		set_state "error:install_failed"
+		rm -rf "$TMP_DIR"
+		return 1
+	}
+
+	echo "$ver" > "$VERSION_FILE"
+	rm -rf "$TMP_DIR"
+	log "安装完成：$ver"
+	set_state "ready"
 }
 
-# Look up a UCI rule by its displayed name and echo:
-# section|mode|local_port|remote_port
+cmd_init() {
+	# If already running, don't start another
+	if [ -f "$STATE_FILE" ]; then
+		local cur; cur=$(cat "$STATE_FILE")
+		case "$cur" in
+			downloading|extracting) echo "started"; return 0 ;;
+		esac
+	fi
+	log_reset
+	set_state "downloading"
+	( do_download "$PHANTUN_REPO" ) >/dev/null 2>&1 &
+	echo "started"
+}
+
+cmd_check_update() {
+	local cur_ver latest
+	cur_ver=$(cmd_cur_version)
+	latest=$(get_latest_tag "$PHANTUN_REPO")
+	[ -n "$latest" ] || { echo "error:fetch_failed"; return 1; }
+	if [ "$cur_ver" = "$latest" ]; then
+		echo "latest|$latest|0"
+	else
+		echo "latest|$latest|1"
+	fi
+}
+
+# Look up a UCI rule by its displayed name.
 _rule_lookup() {
 	local want="$1"
 	local found="" fmode="" flp="" frp=""
@@ -163,12 +281,15 @@ cmd_rule_log() {
 }
 
 case "$1" in
-	status)          cmd_status ;;
-	init_status)     cmd_init_status ;;
-	upload_info)     cmd_upload_info ;;
-	install_binary)  cmd_install_binary "$2" "$3" ;;
-	rule_conn)       cmd_rule_conn "$2" ;;
-	rule_resolved)   cmd_rule_resolved "$2" ;;
-	rule_log)        cmd_rule_log "$2" ;;
-	*) echo "usage: $0 {status|init_status|upload_info|install_binary|rule_conn|rule_resolved|rule_log}" >&2; exit 1 ;;
+	status)        cmd_status ;;
+	init_status)   cmd_init_status ;;
+	init)          cmd_init ;;
+	log)           cmd_log ;;
+	cur_version)   cmd_cur_version ;;
+	cur_repo)      cmd_cur_repo ;;
+	check_update)  cmd_check_update ;;
+	rule_conn)     cmd_rule_conn "$2" ;;
+	rule_resolved) cmd_rule_resolved "$2" ;;
+	rule_log)      cmd_rule_log "$2" ;;
+	*) echo "usage: $0 {status|init_status|init|log|cur_version|cur_repo|check_update|rule_conn|rule_resolved|rule_log}" >&2; exit 1 ;;
 esac

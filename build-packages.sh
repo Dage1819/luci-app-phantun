@@ -43,7 +43,7 @@ Maintainer: $MAINTAINER
 Section: luci
 Priority: optional
 Installed-Size: $INSTALLED_SIZE
-Depends: kmod-tun, bind-host | drill
+Depends: kmod-tun, unzip, curl, bind-host | drill
 Description: $DESCRIPTION
 Homepage: $HOMEPAGE
 License: $LICENSE
@@ -138,7 +138,7 @@ EOF
             --info "origin:$PKG_NAME" \
             --info "url:$HOMEPAGE" \
             --info "maintainer:$MAINTAINER" \
-            --info "depends:kmod-tun" \
+            --info "depends:kmod-tun unzip curl" \
             --script "post-install:/pkg/post-install.sh" \
             --script "post-deinstall:/pkg/post-deinstall.sh" \
             --files /pkg/files \

@@ -30,8 +30,11 @@ var connCache = {};
 var resolvedCache = {};
 
 var initState = 'unknown';
-var uploadInfo = { target: '', archive: '', releases: '' };
-var uploading = false;
+var curVersion = '';
+var curRepo = '';
+var latestVersion = '';
+var hasUpdate = false;
+var checking = false;
 var initUpdaters = [];
 
 function getStatus() {
@@ -48,55 +51,22 @@ function getInitStatus() {
 	}).catch(function () { return 'missing'; });
 }
 
-function getUploadInfo() {
-	return fs.exec(MANAGE, [ 'upload_info' ]).then(function (res) {
-		var out = ((res && res.stdout) ? res.stdout : '').trim();
-		var p = out.split('|');
-		return { target: p[0] || '', archive: p[1] || '', releases: p[2] || '' };
-	}).catch(function () { return { target: '', archive: '', releases: '' }; });
+function getCurVersion() {
+	return fs.exec(MANAGE, [ 'cur_version' ]).then(function (res) {
+		return ((res && res.stdout) ? res.stdout : '').trim() || 'none';
+	}).catch(function () { return 'none'; });
 }
 
-// uploadCore: prompt user to pick a local file, write it to a fixed temp
-// path, then ask the backend to verify (ELF magic) and install it.
-// The caller's filename is completely ignored by the backend; the role
-// determines the canonical destination (/usr/bin/phantun_client or _server).
-//
-// ui.uploadFile(dest, progressCb) -- two-argument form used here for maximum
-// LuCI version compatibility. The "please select ELF not ZIP" notice is
-// shown in the status card, not via a third argument.
-function uploadCore(role, title) {
-	if (uploading) return Promise.resolve();
-	var tmp = '/tmp/phantun_upload_' + role;
-	var errMap = {
-		'not_elf':       '文件不是 ELF 可执行文件（请勿直接上传 ZIP，需先解压）',
-		'empty_file':    '文件为空',
-		'bad_path':      '上传路径不合法',
-		'bad_role':      '角色参数错误',
-		'install_failed':'安装失败（写入 /usr/bin 出错）'
-	};
-	uploading = true;
-	notifyInit();
-	return ui.uploadFile(tmp).then(function () {
-		return fs.exec(MANAGE, [ 'install_binary', role, tmp ]);
-	}).then(function (res) {
-		var out = ((res && res.stdout) ? res.stdout : '').trim();
-		if ((res && res.code !== 0) || out.indexOf('error:') === 0) {
-			var key = out.replace(/^error:/, '');
-			throw new Error(errMap[key] || out || '安装失败');
-		}
-		ui.addNotification(null, E('p', {}, title + ' 已安装成功'), 'info');
-	}).catch(function (e) {
-		// ui.uploadFile rejects with a plain string when the user cancels —
-		// don't show a red notification for that case.
-		var msg = (e && e.message) ? e.message : String(e || '');
-		if (msg && msg !== 'Upload cancelled') {
-			ui.addNotification(null, E('p', {}, title + ' 上传失败：' + msg), 'error');
-		}
-	}).then(function () {
-		uploading = false;
-		notifyInit();
-		return refreshAll();
-	});
+function getCurRepo() {
+	return fs.exec(MANAGE, [ 'cur_repo' ]).then(function (res) {
+		return ((res && res.stdout) ? res.stdout : '').trim() || '';
+	}).catch(function () { return ''; });
+}
+
+function getLog() {
+	return fs.exec(MANAGE, [ 'log' ]).then(function (res) {
+		return ((res && res.stdout) ? res.stdout : '');
+	}).catch(function () { return ''; });
 }
 
 
@@ -162,10 +132,11 @@ function notifyRows() { rowUpdaters.forEach(function (fn) { try { fn(); } catch 
 var allRuleNames = [];
 
 function refreshAll() {
-	return Promise.all([ getInitStatus(), getStatus(), getUploadInfo() ]).then(function (r) {
+	return Promise.all([ getInitStatus(), getStatus(), getCurVersion(), getCurRepo() ]).then(function (r) {
 		initState = r[0] || 'missing';
 		statusCache = r[1] || {};
-		uploadInfo = r[2] || { target: '', archive: '', releases: '' };
+		curVersion = r[2] || 'none';
+		curRepo = r[3] || '';
 		notifyInit();
 		notifyRows();
 
@@ -225,11 +196,23 @@ function runRuleAction(action, name) {
 }
 
 // Map init_status output to display properties.
-function coreStatusInfo(state) {
-	if (state === 'ready')          return { text: '已就绪（两个核心均已安装）', color: '#2e7d32', ready: true, missingClient: false, missingServer: false };
-	if (state === 'missing:client') return { text: '缺少 phantun_client', color: '#c62828', ready: false, missingClient: true, missingServer: false };
-	if (state === 'missing:server') return { text: '缺少 phantun_server', color: '#c62828', ready: false, missingClient: false, missingServer: true };
-	return { text: '核心未安装', color: '#c62828', ready: false, missingClient: true, missingServer: true };
+function initInfo(state) {
+	if (state === 'ready')        return { text: '已就绪', color: '#2e7d32', busy: false, ready: true };
+	if (state === 'downloading')  return { text: '下载中…', color: '#ef6c00', busy: true };
+	if (state === 'extracting')   return { text: '解压中…', color: '#ef6c00', busy: true };
+	if (state && state.indexOf('error:') === 0) {
+		var reason = state.slice(6);
+		var map = {
+			'download_failed':   '下载失败，请检查网络后重试',
+			'extract_failed':    '解压失败',
+			'binary_not_found':  '压缩包内未找到程序文件',
+			'install_failed':    '安装失败',
+			'no_version':        '无法获取最新版本',
+			'unsupported_arch':  '不支持的系统架构'
+		};
+		return { text: '初始化失败', detail: map[reason] || reason, color: '#c62828', busy: false, error: true };
+	}
+	return { text: '未初始化', color: '#757575', busy: false };
 }
 
 return view.extend({
@@ -250,132 +233,174 @@ return view.extend({
 		m = new form.Map('phantun', 'Phantun',
 			'将 UDP 流量伪装成真实 TCP 连接（FakeTCP），穿透只允许 TCP 或对 UDP 限速/封锁的网络。性能高、开销小，常配合 WireGuard 使用。');
 
-		// ================= 程序状态（核心安装 / 手动上传）=================
+		// ================= 程序状态（版本 / 初始化 / 检测更新）=================
 		s = m.section(form.TypedSection, '_status');
 		s.anonymous = true;
 		s.render = L.bind(function () {
 			var self = this;
-			var CARD_ID   = 'ph_core_card';
-			var STATUS_ID = 'ph_core_status';
-			var CLIENT_ID = 'ph_client_row';
-			var SERVER_ID = 'ph_server_row';
+			var statusRowId = 'ph_status_row';
+			var versionRowId = 'ph_version_row';
 
-			// Helper: render one binary row (client or server).
-			// Shows installed/missing badge and an upload button.
-			var makeBinaryRow = function (role, label, missing) {
-				var badge = missing
-					? E('span', { 'style': 'color:#c62828;font-weight:600;margin-right:10px' }, '未安装')
-					: E('span', { 'style': 'color:#2e7d32;font-weight:600;margin-right:10px' }, '已安装');
-
-				var btnLabel = missing ? '上传安装' : '重新上传';
-				var btn = E('button', {
-					'class': 'cbi-button cbi-button-action',
-					'disabled': uploading ? 'disabled' : null,
-					'click': ui.createHandlerFn(self, function () {
-						return uploadCore(role, label);
-					})
-				}, btnLabel);
-
-				return E('div', {
-					'id': role === 'client' ? CLIENT_ID : SERVER_ID,
-					'class': 'cbi-value'
-				}, [
-					E('label', { 'class': 'cbi-value-title' }, label),
-					E('div', { 'class': 'cbi-value-field' }, [ badge, btn ])
+			var showInitLogModal = function (title) {
+				var logId = 'ph_init_log';
+				var pre = E('pre', {
+					'id': logId,
+					'style': 'max-height:320px;overflow:auto;background:#1e1e1e;color:#d4d4d4;' +
+						'padding:12px;border-radius:6px;font-size:12px;line-height:1.5;white-space:pre-wrap;margin:0'
+				}, '正在启动…');
+				var closeBtn = E('button', {
+					'class': 'cbi-button cbi-button-neutral',
+					'disabled': 'disabled',
+					'click': ui.hideModal
+				}, '请稍候…');
+				ui.showModal(title || '初始化中', [
+					E('p', { 'style': 'color:#c62828;font-weight:600' },
+						'⚠ 正在下载并安装核心程序，请勿关闭本窗口或离开页面。'),
+					pre,
+					E('div', { 'class': 'right', 'style': 'margin-top:12px' }, [ closeBtn ])
 				]);
+				var timer = null;
+				var finish = function (ok) {
+					if (timer) { clearInterval(timer); timer = null; }
+					closeBtn.removeAttribute('disabled');
+					closeBtn.textContent = '关闭';
+					closeBtn.className = 'cbi-button ' + (ok ? 'cbi-button-save' : 'cbi-button-reset');
+				};
+				var tick = function () {
+					Promise.all([ getLog(), getInitStatus() ]).then(function (r) {
+						var el = document.getElementById(logId);
+						if (el) { el.textContent = r[0] || '正在启动…'; el.scrollTop = el.scrollHeight; }
+						if (r[1] === 'ready') { finish(true); refreshAll(); }
+						else if (r[1] && r[1].indexOf('error:') === 0) { finish(false); refreshAll(); }
+					});
+				};
+				timer = setInterval(tick, 1000);
+				tick();
 			};
 
-			var renderCard = function () {
-				var info = coreStatusInfo(initState);
+			var renderStatus = function () {
+				var info = initInfo(initState);
 
-				// Overall status line
-				var statusEl = document.getElementById(STATUS_ID);
-				if (statusEl) {
-					statusEl.innerHTML = '';
-					statusEl.appendChild(
-						E('span', { 'style': 'font-weight:600;color:' + info.color }, info.text)
-					);
+				var el = document.getElementById(statusRowId);
+				if (el) {
+					var parts = [ E('span', { 'style': 'font-weight:600;color:' + info.color }, info.text) ];
+					if (info.busy) parts.push(E('span', { 'class': 'spinning', 'style': 'margin-left:10px' }, ' '));
+					if (info.error && info.detail)
+						parts.push(E('span', { 'style': 'margin-left:10px;color:#c62828;font-size:12px' }, '（' + info.detail + '）'));
+					el.innerHTML = '';
+					parts.forEach(function (p) { el.appendChild(p); });
 				}
 
-				// Re-render both binary rows in place
-				var clientEl = document.getElementById(CLIENT_ID);
-				if (clientEl) {
-					var newClient = makeBinaryRow('client', 'phantun_client', info.missingClient);
-					clientEl.parentNode.replaceChild(newClient, clientEl);
-				}
-				var serverEl = document.getElementById(SERVER_ID);
-				if (serverEl) {
-					var newServer = makeBinaryRow('server', 'phantun_server', info.missingServer);
-					serverEl.parentNode.replaceChild(newServer, serverEl);
+				var vel = document.getElementById(versionRowId);
+				if (vel) {
+					var kids = [];
+					var vtxt = (curVersion && curVersion !== 'none') ? curVersion : (info.ready ? '已安装' : '—');
+					kids.push(E('span', { 'style': 'font-family:monospace;font-weight:600;margin-right:12px' }, vtxt));
+
+					if (info.busy) {
+						/* 处理中 */
+					} else if (!info.ready) {
+						kids.push(E('button', {
+							'class': 'cbi-button cbi-button-action important',
+							'click': ui.createHandlerFn(self, function () {
+								return fs.exec(MANAGE, [ 'init' ]).then(function (res) {
+									var out = ((res && res.stdout) ? res.stdout : '').trim();
+									if ((res && res.code !== 0) || out.indexOf('error:') === 0) {
+										ui.addNotification(null, E('p', {}, '初始化失败：' + (out || '未知错误')), 'error');
+										return refreshAll();
+									}
+									initState = 'downloading'; notifyInit();
+									showInitLogModal('初始化 Phantun');
+									return refreshAll();
+								}).catch(function (e) {
+									ui.addNotification(null, E('p', {}, '初始化失败：' + (e.message || e)), 'error');
+								});
+							})
+						}, info.error ? '重新初始化' : '初始化'));
+					} else if (hasUpdate) {
+						kids.push(E('span', { 'style': 'color:#ef6c00;margin-right:10px;font-size:12px' }, '发现新版 ' + latestVersion));
+						kids.push(E('button', {
+							'class': 'cbi-button cbi-button-action important',
+							'click': ui.createHandlerFn(self, function () {
+								return fs.exec(MANAGE, [ 'init' ]).then(function (res) {
+									var out = ((res && res.stdout) ? res.stdout : '').trim();
+									if ((res && res.code !== 0) || out.indexOf('error:') === 0) {
+										ui.addNotification(null, E('p', {}, '更新失败：' + (out || '未知错误')), 'error');
+										return refreshAll();
+									}
+									initState = 'downloading'; hasUpdate = false; notifyInit();
+									showInitLogModal('更新 Phantun');
+									return refreshAll();
+								}).catch(function (e) {
+									ui.addNotification(null, E('p', {}, '更新失败：' + (e.message || e)), 'error');
+								});
+							})
+						}, '立即更新'));
+					} else {
+						kids.push(E('button', {
+							'class': 'cbi-button cbi-button-neutral',
+							'disabled': checking ? 'disabled' : null,
+							'click': ui.createHandlerFn(self, function () {
+								checking = true; notifyInit();
+								return fs.exec(MANAGE, [ 'check_update' ]).then(function (res) {
+									checking = false;
+									var out = ((res && res.stdout) ? res.stdout : '').trim();
+									var p = out.split('|');
+									if (p[0] === 'latest' && p[1]) {
+										latestVersion = p[1];
+										hasUpdate = (p[2] === '1');
+										if (!hasUpdate)
+											ui.addNotification(null, E('p', {}, '已是最新版本 ' + latestVersion), 'info');
+									} else {
+										ui.addNotification(null, E('p', {}, '检测更新失败，请稍后重试'), 'warning');
+									}
+									notifyInit();
+								}).catch(function (e) {
+									checking = false; notifyInit();
+									ui.addNotification(null, E('p', {}, '检测更新失败：' + (e.message || e)), 'error');
+								});
+							})
+						}, checking ? '检测中…' : '检测更新'));
+					}
+					vel.innerHTML = '';
+					kids.forEach(function (k) { vel.appendChild(k); });
 				}
 			};
 
-			initUpdaters.push(renderCard);
+			initUpdaters.push(renderStatus);
 			ensurePoll();
+			requestAnimationFrame(renderStatus);
 
-			// Initial card skeleton — real data arrives with first poll tick
-			var info0 = coreStatusInfo(initState);
-			var releasesHref = uploadInfo.releases || 'https://github.com/Dage1819/phantun/releases';
+			// Manual install note shown below status card
+			var manualNote = E('div', { 'style': 'color:#666;font-size:12px;margin-top:4px;line-height:1.6' }, [
+				'手动安装：通过 SSH 将对应架构的二进制文件上传至路由器，',
+				E('br'),
+				'重命名为 ',
+				E('code', {}, '/usr/bin/phantun_client'),
+				' 和 ',
+				E('code', {}, '/usr/bin/phantun_server'),
+				'，chmod +x 后重启服务。版本号将显示为"未知"。'
+			]);
 
-			return E('div', { 'class': 'cbi-section', 'id': CARD_ID }, [
-				E('h3', {}, '核心程序'),
-
-				// Overall status
+			return E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, '程序状态'),
 				E('div', { 'class': 'cbi-value' }, [
 					E('label', { 'class': 'cbi-value-title' }, '核心状态'),
-					E('div', { 'class': 'cbi-value-field', 'id': STATUS_ID },
-						E('em', {}, '加载中…'))
+					E('div', { 'class': 'cbi-value-field', 'id': statusRowId }, E('em', {}, '加载中…'))
 				]),
-
-				// Target triple (shown once upload_info resolves)
 				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, '目标架构'),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('span', { 'id': 'ph_target', 'style': 'font-family:monospace' },
-							uploadInfo.target || '检测中…'),
-						E('span', { 'style': 'color:#666;font-size:12px;margin-left:10px' },
-							'（请在电脑上从 Releases 下载对应 ZIP，解压后分别上传两个 ELF 文件）')
-					])
+					E('label', { 'class': 'cbi-value-title' }, '已安装版本'),
+					E('div', { 'class': 'cbi-value-field', 'id': versionRowId }, E('em', {}, '…'))
 				]),
-
-				// Expected archive name + releases link
 				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, '预期压缩包'),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('span', { 'id': 'ph_archive', 'style': 'font-family:monospace;margin-right:12px' },
-							uploadInfo.archive || '…'),
-						E('a', {
-							'id': 'ph_releases_link',
-							'href': releasesHref,
-							'target': '_blank',
-							'rel': 'noreferrer noopener'
-						}, '前往 Releases 页面 ↗')
-					])
+					E('label', { 'class': 'cbi-value-title' }, '核心来源'),
+					E('div', { 'class': 'cbi-value-field', 'style': 'font-family:monospace' },
+						curRepo ? 'https://github.com/' + curRepo : '…')
 				]),
-
-				// Note about upload requirements
 				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, '上传说明'),
-					E('div', { 'class': 'cbi-value-field', 'style': 'color:#555;font-size:13px' },
-						'本地文件名不限；上传后自动安装为标准名称。请勿上传 ZIP——只接受已解压的 ELF 可执行文件。')
-				]),
-
-				// Per-binary rows
-				makeBinaryRow('client', 'phantun_client', info0.missingClient),
-				makeBinaryRow('server', 'phantun_server', info0.missingServer),
-
-				// Dynamic update of target/archive/releases link on poll tick
-				(function () {
-					initUpdaters.push(function () {
-						var te = document.getElementById('ph_target');
-						var ae = document.getElementById('ph_archive');
-						var le = document.getElementById('ph_releases_link');
-						if (te && uploadInfo.target) te.textContent = uploadInfo.target;
-						if (ae && uploadInfo.archive) ae.textContent = uploadInfo.archive;
-						if (le && uploadInfo.releases) le.href = uploadInfo.releases;
-					});
-					return E('span', {});  // placeholder node
-				})()
+					E('label', { 'class': 'cbi-value-title' }, '手动安装'),
+					E('div', { 'class': 'cbi-value-field' }, manualNote)
+				])
 			]);
 		}, s, this);
 

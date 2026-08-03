@@ -17,11 +17,9 @@ PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Dage
 
 LUCI_TITLE:=LuCI support for Phantun (UDP over FakeTCP)
+# curl: download release zip. unzip: extract release zip.
 # kmod-tun: Phantun creates TUN interfaces.
-# The Phantun binaries are NOT downloaded automatically; the user uploads
-# them manually via the LuCI interface after downloading from the Releases
-# page. No curl or unzip is required at runtime.
-LUCI_DEPENDS:=+kmod-tun
+LUCI_DEPENDS:=+kmod-tun +unzip +curl
 LUCI_PKGARCH:=all
 
 # bind-host | drill: either DNS lookup tool satisfies the DDNS monitor's
