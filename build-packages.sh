@@ -103,7 +103,7 @@ EOF
         -v "$apk_dir/post-install.sh:/pkg/post-install.sh:ro" \
         -v "$(pwd)/$DIST_DIR:/pkg/out" \
         alpine:edge sh -ec '
-          apk add --no-cache alpine-sdk git meson samurai openssl-dev zlib-dev
+          apk add --no-cache alpine-sdk git meson samurai linux-headers openssl-dev zlib-dev
           git clone --depth 1 https://gitlab.alpinelinux.org/alpine/apk-tools.git /tmp/apk-tools
           meson setup /tmp/apk-tools-build /tmp/apk-tools
           meson compile -C /tmp/apk-tools-build
