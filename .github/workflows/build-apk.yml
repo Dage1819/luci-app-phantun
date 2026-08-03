@@ -2,14 +2,12 @@ name: Build APK and IPK packages
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: Release tag
-        required: true
-        default: v1.3.10
       publish:
         description: Publish packages to Release
         required: true
@@ -18,9 +16,6 @@ on:
 
 permissions:
   contents: write
-
-env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
   release:
@@ -35,35 +30,27 @@ jobs:
           rm -rf dist
           DIST_DIR=dist ./build-packages.sh
 
-      - name: Extract package metadata
+      - name: Extract package metadata and verify tag
         id: version
         run: |
           set -e
           VER=$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -n1)
           REL=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -n1)
+          TAG="v${VER}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "$TAG" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Makefile PKG_VERSION ${TAG}" >&2
+            exit 1
+          fi
           APK="luci-app-phantun-${VER}-r${REL}.apk"
           IPK="luci-app-phantun_${VER}-${REL}_all.ipk"
           test -s "dist/$APK"
           test -s "dist/$IPK"
+          test -s dist/packages.adb
+          test -s dist/apk-metadata.json
           echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
           echo "ipk=$IPK" >> "$GITHUB_OUTPUT"
-
-      - name: Generate APK index
-        run: |
-          set -e
-          mkdir -p dist/apk_staging
-          cp "dist/${{ steps.version.outputs.apk }}" dist/apk_staging/
-          docker run --rm \
-            -v "$PWD/dist/apk_staging:/repo" \
-            alpine:latest sh -c '
-              set -e
-              cd /repo
-              command -v apk
-              apk mkndx --allow-untrusted -o packages.adb *.apk
-            '
-          test -s dist/apk_staging/packages.adb
-          rm -f dist/apk_staging/*.apk
 
       - name: Generate IPK index
         run: |
@@ -85,33 +72,36 @@ jobs:
           set -eux
           test -s "dist/${{ steps.version.outputs.apk }}"
           test -s "dist/${{ steps.version.outputs.ipk }}"
-          test -s dist/apk_staging/packages.adb
+          test -s dist/packages.adb
+          test -s dist/apk-metadata.json
           test -s dist/Packages
           test -s dist/Packages.gz
           tar -tzf "dist/${{ steps.version.outputs.ipk }}" | grep -q './data.tar.gz'
           tar -tzf "dist/${{ steps.version.outputs.ipk }}" | grep -q './control.tar.gz'
-          ls -lh dist/"${{ steps.version.outputs.apk }}" dist/"${{ steps.version.outputs.ipk }}" dist/apk_staging/packages.adb
+          grep -q 'luci-app-phantun' dist/apk-metadata.json
+          ls -lh dist/"${{ steps.version.outputs.apk }}" dist/"${{ steps.version.outputs.ipk }}" dist/packages.adb
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: luci-app-phantun-packages-${{ env.RELEASE_TAG }}
+          name: luci-app-phantun-packages-${{ steps.version.outputs.tag }}
           path: |
             dist/*.apk
             dist/*.ipk
-            dist/apk_staging/packages.adb
+            dist/packages.adb
+            dist/apk-metadata.json
             dist/Packages
             dist/Packages.gz
           if-no-files-found: error
 
       - name: Create or update GitHub Release
-        if: github.event_name == 'push' || inputs.publish
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "${{ env.RELEASE_TAG }}" >/dev/null 2>&1 || \
-            gh release create "${{ env.RELEASE_TAG }}" --title "${{ env.RELEASE_TAG }}" \
+          gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1 || \
+            gh release create "${{ steps.version.outputs.tag }}" --title "${{ steps.version.outputs.tag }}" \
               --notes "luci-app-phantun APK and IPK packages"
-          gh release upload "${{ env.RELEASE_TAG }}" \
+          gh release upload "${{ steps.version.outputs.tag }}" \
             "dist/${{ steps.version.outputs.apk }}" \
             "dist/${{ steps.version.outputs.ipk }}" --clobber
