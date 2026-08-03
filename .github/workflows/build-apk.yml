@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: GitHub Release tag
+        description: Release tag
         required: true
-        default: v1.3.8
+        default: v1.3.10
       publish:
-        description: Create/update GitHub Release and upload both packages
+        description: Publish packages to Release
         required: true
         default: true
         type: boolean
@@ -23,30 +23,74 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
-  build-packages:
+  release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout plugin
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build real IPK and APK without OpenWrt source tree
+      - name: Build packages
         run: |
           chmod +x build-packages.sh
+          rm -rf dist
           DIST_DIR=dist ./build-packages.sh
 
-      - name: Validate package files
+      - name: Extract package metadata
+        id: version
+        run: |
+          set -e
+          VER=$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -n1)
+          REL=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -n1)
+          APK="luci-app-phantun-${VER}-r${REL}.apk"
+          IPK="luci-app-phantun_${VER}-${REL}_all.ipk"
+          test -s "dist/$APK"
+          test -s "dist/$IPK"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "ipk=$IPK" >> "$GITHUB_OUTPUT"
+
+      - name: Generate APK index
+        run: |
+          set -e
+          mkdir -p dist/apk_staging
+          cp "dist/${{ steps.version.outputs.apk }}" dist/apk_staging/
+          docker run --rm \
+            -v "$PWD/dist/apk_staging:/repo" \
+            alpine:latest sh -c '
+              set -e
+              cd /repo
+              command -v apk
+              apk mkndx --allow-untrusted -o packages.adb *.apk
+            '
+          test -s dist/apk_staging/packages.adb
+          rm -f dist/apk_staging/*.apk
+
+      - name: Generate IPK index
+        run: |
+          set -e
+          cd dist
+          mkdir -p _tmp
+          tar xzf "${{ steps.version.outputs.ipk }}" -C _tmp ./control.tar.gz
+          tar xzf _tmp/control.tar.gz -C _tmp ./control
+          cat _tmp/control > Packages
+          echo "Filename: ${{ steps.version.outputs.ipk }}" >> Packages
+          echo "Size: $(stat -c%s "${{ steps.version.outputs.ipk }}")" >> Packages
+          echo "SHA256sum: $(sha256sum "${{ steps.version.outputs.ipk }}" | cut -d' ' -f1)" >> Packages
+          echo >> Packages
+          gzip -kf Packages
+          rm -rf _tmp
+
+      - name: Validate outputs
         run: |
           set -eux
-          APK=$(find dist -maxdepth 1 -type f -name '*.apk' | head -n 1)
-          IPK=$(find dist -maxdepth 1 -type f -name '*.ipk' | head -n 1)
-          test -n "$APK"
-          test -n "$IPK"
-          test -s "$APK"
-          test -s "$IPK"
-          ar t "$IPK" | grep -q '^data.tar'
-          ar t "$IPK" | grep -q '^control.tar'
-          file "$APK" "$IPK"
-          ls -lh "$APK" "$IPK"
+          test -s "dist/${{ steps.version.outputs.apk }}"
+          test -s "dist/${{ steps.version.outputs.ipk }}"
+          test -s dist/apk_staging/packages.adb
+          test -s dist/Packages
+          test -s dist/Packages.gz
+          tar -tzf "dist/${{ steps.version.outputs.ipk }}" | grep -q './data.tar.gz'
+          tar -tzf "dist/${{ steps.version.outputs.ipk }}" | grep -q './control.tar.gz'
+          ls -lh dist/"${{ steps.version.outputs.apk }}" dist/"${{ steps.version.outputs.ipk }}" dist/apk_staging/packages.adb
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -55,16 +99,19 @@ jobs:
           path: |
             dist/*.apk
             dist/*.ipk
+            dist/apk_staging/packages.adb
+            dist/Packages
+            dist/Packages.gz
           if-no-files-found: error
 
-      - name: Publish both packages to the same Release
+      - name: Create or update GitHub Release
         if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "${{ env.RELEASE_TAG }}" >/dev/null 2>&1 || \
-            gh release create "${{ env.RELEASE_TAG }}" \
-              --title "${{ env.RELEASE_TAG }}" \
+            gh release create "${{ env.RELEASE_TAG }}" --title "${{ env.RELEASE_TAG }}" \
               --notes "luci-app-phantun APK and IPK packages"
           gh release upload "${{ env.RELEASE_TAG }}" \
-            dist/*.apk dist/*.ipk --clobber
+            "dist/${{ steps.version.outputs.apk }}" \
+            "dist/${{ steps.version.outputs.ipk }}" --clobber

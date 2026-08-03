@@ -10,7 +10,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-phantun
-PKG_VERSION:=1.3.9
+PKG_VERSION:=1.3.10
 PKG_RELEASE:=1
 
 PKG_LICENSE:=Apache-2.0
