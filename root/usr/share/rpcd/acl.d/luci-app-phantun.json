@@ -7,21 +7,20 @@
 				"service": [ "list" ]
 			},
 			"file": {
-				"/usr/share/phantun/manage.sh *": [ "exec" ],
-				"/tmp/phantun_upload_client": [ "read", "write" ],
-				"/tmp/phantun_upload_server": [ "read", "write" ]
+				"/usr/share/phantun/manage.sh *": [ "exec" ]
 			}
 		},
 		"write": {
 			"uci": [ "phantun" ],
+			"cgi-io": [ "upload" ],
 			"ubus": {
 				"service": [ "event" ]
 			},
 			"file": {
 				"/etc/init.d/phantun *": [ "exec" ],
 				"/usr/share/phantun/manage.sh *": [ "exec" ],
-				"/tmp/phantun_upload_client": [ "read", "write" ],
-				"/tmp/phantun_upload_server": [ "read", "write" ]
+				"/tmp/phantun_upload_client": [ "write" ],
+				"/tmp/phantun_upload_server": [ "write" ]
 			}
 		}
 	}
