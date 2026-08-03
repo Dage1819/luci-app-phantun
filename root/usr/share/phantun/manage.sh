@@ -82,11 +82,6 @@ cmd_install_binary() {
 	[ "$src" = "$expected" ] || { echo "error:bad_path"; return 1; }
 	[ -f "$src" ] && [ -s "$src" ] || { rm -f "$src"; echo "error:empty_file"; return 1; }
 
-	# Reject ZIP files, text, and downloaded error pages. Do not execute the
-	# untrusted upload for validation; startup will reveal any arch mismatch.
-	magic=$(hexdump -n 4 -e '4/1 "%02x"' "$src" 2>/dev/null)
-	[ "$magic" = "7f454c46" ] || { rm -f "$src"; echo "error:not_elf"; return 1; }
-
 	pgrep -x phantun_client >/dev/null 2>&1 && service_was_running=1
 	pgrep -x phantun_server >/dev/null 2>&1 && service_was_running=1
 	[ "$service_was_running" = "1" ] && /etc/init.d/phantun stop >/dev/null 2>&1
