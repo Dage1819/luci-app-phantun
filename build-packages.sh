@@ -74,6 +74,8 @@ EOF
     (cd "$ipk_dir/control" && "$TAR" --format=gnu --numeric-owner --owner=0 --group=0 -cf - . | gzip -n > "$ipk_dir/control.tar.gz")
     (cd "$ipk_dir" && "$TAR" --format=gnu --numeric-owner --owner=0 --group=0 -cf - ./debian-binary ./data.tar.gz ./control.tar.gz | gzip -n > "$OLDPWD/$DIST_DIR/$IPK_FILE")
 }
+
+make_apk() {
     command -v docker >/dev/null 2>&1 || { echo "Docker is required to build APK" >&2; exit 1; }
     local apk_dir="$WORK_DIR/apk"
     mkdir -p "$apk_dir"
