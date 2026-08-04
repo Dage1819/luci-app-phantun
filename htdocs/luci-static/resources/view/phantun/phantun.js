@@ -406,8 +406,14 @@ return view.extend({
 											return;
 										}
 										ui.hideModal();
-										return uci.set('phantun', 'global', 'repo', val).then(function () {
-											return uci.save();
+										// First set UCI so manage.sh picks up the new repo,
+										// then init (downloads from new repo),
+										// only keep UCI if init actually succeeded.
+										return L.require('uci').then(function (u) {
+											return u.load('phantun').then(function () {
+												u.set('phantun', 'global', 'repo', val);
+												return u.save();
+											});
 										}).then(function () {
 											return fs.exec(MANAGE, [ 'init' ]);
 										}).then(function (res) {
