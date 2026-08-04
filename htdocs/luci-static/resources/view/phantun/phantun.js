@@ -694,6 +694,7 @@ return view.extend({
 			'仅服务端。勾选后自动把外网 TCP（本地端口）转发到 Phantun 并放行，无需手动配置防火墙。取消勾选并保存后会自动清除对应规则。默认同时覆盖 IPv4 与 IPv6。');
 		o.default = '1';
 		o.rmempty = false;
+		o.rmempty = false;
 		o.depends('mode', 'server');
 		o.modalonly = true;
 

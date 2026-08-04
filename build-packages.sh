@@ -30,6 +30,7 @@ if [ -d htdocs ]; then
     cp -a htdocs/. "$DATA_DIR/www/"
 fi
 find "$DATA_DIR" -type f -name '*.sh' -exec chmod 755 {} +
+find "$DATA_DIR/etc/init.d" -type f -exec chmod 755 {} + 2>/dev/null || true
 INSTALLED_SIZE="$(du -sk "$DATA_DIR" | awk '{print $1}')"
 
 make_ipk() {
