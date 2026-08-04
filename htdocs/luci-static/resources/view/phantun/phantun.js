@@ -381,7 +381,7 @@ return view.extend({
 						var input = E('input', {
 							'type': 'text',
 							'style': 'width:360px;font-family:monospace',
-							'value': curRepo || '',
+							'value': curRepo ? 'https://github.com/' + curRepo : '',
 							'placeholder': 'owner/repo 或 https://github.com/owner/repo'
 						});
 						ui.showModal('修改核心仓库', [
