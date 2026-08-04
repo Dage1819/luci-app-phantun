@@ -100,9 +100,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1 || \
-            gh release create "${{ steps.version.outputs.tag }}" --title "${{ steps.version.outputs.tag }}" \
-              --notes "luci-app-phantun APK and IPK packages"
+          # Create release if it doesn't exist, or update existing one to non-draft
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            gh release edit "${{ steps.version.outputs.tag }}" --draft=false
+          else
+            gh release create "${{ steps.version.outputs.tag }}" \
+              --title "${{ steps.version.outputs.tag }}" \
+              --notes "luci-app-phantun APK and IPK packages" \
+              --draft=false
+          fi
           gh release upload "${{ steps.version.outputs.tag }}" \
             "dist/${{ steps.version.outputs.apk }}" \
             "dist/${{ steps.version.outputs.ipk }}" --clobber
