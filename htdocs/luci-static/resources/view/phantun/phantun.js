@@ -367,20 +367,75 @@ return view.extend({
 				}
 			};
 
+			var repoRowId = 'ph_repo_row';
+
+			var renderRepo = function () {
+				var rel = document.getElementById(repoRowId);
+				if (!rel) return;
+				var url = curRepo ? 'https://github.com/' + curRepo : '（未设置）';
+				rel.innerHTML = '';
+				rel.appendChild(E('span', { 'style': 'font-family:monospace;margin-right:10px' }, url));
+				rel.appendChild(E('button', {
+					'class': 'cbi-button cbi-button-neutral',
+					'click': ui.createHandlerFn(self, function () {
+						var input = E('input', {
+							'type': 'text',
+							'style': 'width:360px;font-family:monospace',
+							'value': curRepo || '',
+							'placeholder': 'owner/repo 或 https://github.com/owner/repo'
+						});
+						ui.showModal('修改核心仓库', [
+							E('p', {}, '修改后将立即重新下载并安装对应仓库的最新版本。'),
+							input,
+							E('div', { 'class': 'right', 'style': 'margin-top:12px' }, [
+								E('button', {
+									'class': 'cbi-button cbi-button-neutral',
+									'style': 'margin-right:8px',
+									'click': ui.hideModal
+								}, '取消'),
+								E('button', {
+									'class': 'cbi-button cbi-button-action important',
+									'click': ui.createHandlerFn(self, function () {
+										var val = (input.value || '').trim()
+											.replace(/^https?:\/\//, '')
+											.replace(/^github\.com\//, '')
+											.replace(/\.git$/, '')
+											.split('/').slice(0, 2).join('/');
+										if (!val || val.indexOf('/') === -1) {
+											ui.addNotification(null, E('p', {}, '仓库地址格式不正确'), 'warning');
+											return;
+										}
+										ui.hideModal();
+										return uci.set('phantun', 'global', 'repo', val).then(function () {
+											return uci.save();
+										}).then(function () {
+											return fs.exec(MANAGE, [ 'init' ]);
+										}).then(function (res) {
+											var out = ((res && res.stdout) ? res.stdout : '').trim();
+											if ((res && res.code !== 0) || out.indexOf('error:') === 0) {
+												ui.addNotification(null, E('p', {}, '初始化失败：' + (out || '未知错误')), 'error');
+												return refreshAll();
+											}
+											initState = 'downloading'; notifyInit();
+											showInitLogModal('切换核心仓库并重新初始化');
+											return refreshAll();
+										}).catch(function (e) {
+											ui.addNotification(null, E('p', {}, '操作失败：' + (e.message || e)), 'error');
+										});
+									})
+								}, '确认并重新初始化')
+							])
+						]);
+						setTimeout(function () { input.focus(); input.select(); }, 100);
+					})
+				}, '修改'));
+			};
+
+			initUpdaters.push(renderRepo);
 			initUpdaters.push(renderStatus);
 			ensurePoll();
 			requestAnimationFrame(renderStatus);
-
-			// Manual install note shown below status card
-			var manualNote = E('div', { 'style': 'color:#666;font-size:12px;margin-top:4px;line-height:1.6' }, [
-				'手动安装：通过 SSH 将对应架构的二进制文件上传至路由器，',
-				E('br'),
-				'重命名为 ',
-				E('code', {}, '/usr/bin/phantun_client'),
-				' 和 ',
-				E('code', {}, '/usr/bin/phantun_server'),
-				'，chmod +x 后重启服务。版本号将显示为"未知"。'
-			]);
+			requestAnimationFrame(renderRepo);
 
 			return E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, '程序状态'),
@@ -393,13 +448,18 @@ return view.extend({
 					E('div', { 'class': 'cbi-value-field', 'id': versionRowId }, E('em', {}, '…'))
 				]),
 				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, '核心来源'),
-					E('div', { 'class': 'cbi-value-field', 'style': 'font-family:monospace' },
-						curRepo ? 'https://github.com/' + curRepo : '…')
+					E('label', { 'class': 'cbi-value-title' }, '核心仓库'),
+					E('div', { 'class': 'cbi-value-field', 'id': repoRowId }, E('em', {}, '…'))
 				]),
 				E('div', { 'class': 'cbi-value' }, [
 					E('label', { 'class': 'cbi-value-title' }, '手动安装'),
-					E('div', { 'class': 'cbi-value-field' }, manualNote)
+					E('div', { 'class': 'cbi-value-field', 'style': 'color:#666;font-size:12px;line-height:1.6' }, [
+						'通过 SSH 上传二进制到路由器，重命名为 ',
+						E('code', {}, '/usr/bin/phantun_client'),
+						' 和 ',
+						E('code', {}, '/usr/bin/phantun_server'),
+						'，chmod +x 后重启服务。版本号显示为"未知"。'
+					])
 				])
 			]);
 		}, s, this);
