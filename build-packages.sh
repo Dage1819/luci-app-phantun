@@ -139,7 +139,7 @@ EOF
             --info "origin:$PKG_NAME" \
             --info "url:$HOMEPAGE" \
             --info "maintainer:$MAINTAINER" \
-            --info "depends:kmod-tun unzip curl" \
+            --info "depends:kmod-tun unzip curl bind-host" \
             --script "post-install:/pkg/post-install.sh" \
             --script "post-deinstall:/pkg/post-deinstall.sh" \
             --files /pkg/files \
